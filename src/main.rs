@@ -48,6 +48,13 @@ fn is_claude_code(sample: &Sample) -> bool {
         || head.contains("@anthropic-ai/claude-code")
 }
 
+fn is_smartgit(sample: &Sample) -> bool {
+    sample
+        .cmdline_args
+        .iter()
+        .any(|a| a.contains("/smartgit/") || a.ends_with("/smartgit.sh"))
+}
+
 /// True if any ancestor (via real ppid in /proc) was launched through Happy.
 fn ancestor_via_happy(pid: u32, snap: &HashMap<u32, Sample>) -> bool {
     let mut next = snap.get(&pid).map(|s| s.ppid).unwrap_or(0);
@@ -80,6 +87,9 @@ fn pretty_cmdline(pid: u32, sample: &Sample, snap: &HashMap<u32, Sample>) -> Str
         } else {
             "Claude Code".to_string()
         };
+    }
+    if is_smartgit(sample) {
+        return "SmartGit".to_string();
     }
     if sample.cmdline_args.is_empty() {
         return format!("[{}]", sample.comm);
