@@ -228,11 +228,21 @@ cases. Run them in CI; they don't touch real sysfs.
 you can use wattaouille in proprietary projects, but modifications to
 existing wattaouille files must be shared back under MPL-2.0.
 
+## Special thanks
+
+- **[Scaphandre](https://github.com/hubblo-org/scaphandre)** — open-source
+  energy-consumption metrology agent. wattaouille reuses its core insight
+  (per-process watts = package watts × CPU share) and would have been
+  far more painful to figure out without it.
+- The Linux kernel **`intel_rapl_common`** and **`intel_rapl_msr`** modules
+  (alongside the `powercap` subsystem) for exposing the RAPL counters at
+  `/sys/class/powercap/intel-rapl:0/`. Without them this whole project would
+  have to talk to MSRs directly and live in kernel space.
+- The Linux kernel **`power_supply`** subsystem maintainers for the
+  `BAT*` and `AC` sysfs entries that the battery cross-check reads from.
+
 ---
 
 *Written while listening to Indila's "Mini World":*
 
 > *mini world mini..mini world mini*
-
-Sometimes a song gets stuck in your head and you write its name into a
-README to make it stop. It does not work, but you do feel better. ✨
