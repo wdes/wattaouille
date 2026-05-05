@@ -605,6 +605,11 @@ impl BatterySensor {
 struct BacklightSensor {
     brightness_path: Option<String>,
     bl_power_path: Option<String>,
+    /// `/sys/class/drm/<card-eDP-N>/dpms` for every laptop panel that is
+    /// currently `enabled` and `connected`. This is the modern source of
+    /// truth — XFCE's blank-screen / xset dpms / DPMS-on-suspend all flip
+    /// these without necessarily touching legacy `bl_power`.
+    dpms_paths: Vec<String>,
     max_brightness: u64,
 }
 
@@ -615,6 +620,7 @@ impl BacklightSensor {
     const MAX_W: f64 = 3.5;
 
     fn detect() -> Self {
+        let dpms_paths = Self::discover_dpms_paths();
         if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
             for entry in entries.flatten() {
                 let p = entry.path().join("brightness");
@@ -632,6 +638,7 @@ impl BacklightSensor {
                         } else {
                             None
                         },
+                        dpms_paths,
                         max_brightness: max.max(1),
                     };
                 }
@@ -640,19 +647,64 @@ impl BacklightSensor {
         Self {
             brightness_path: None,
             bl_power_path: None,
+            dpms_paths,
             max_brightness: 1,
         }
     }
 
-    /// True when the kernel says the panel is in any blank/powered-down state
-    /// (any non-zero bl_power value: 1=NORMAL, 2=VSYNC_SUSPEND, 3=HSYNC_SUSPEND,
-    /// 4=POWERDOWN). When the file is missing, assume the panel is on.
-    fn is_powered_off(&self) -> bool {
-        let Some(p) = &self.bl_power_path else { return false };
-        match fs::read_to_string(p) {
-            Ok(s) => s.trim().parse::<u32>().map(|v| v != 0).unwrap_or(false),
-            Err(_) => false,
+    /// Scan /sys/class/drm for laptop panel connectors (eDP / LVDS) that
+    /// are enabled + connected, and return their `dpms` file paths.
+    fn discover_dpms_paths() -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Laptop panels: card<N>-eDP-<M> or card<N>-LVDS-<M>.
+            if !(name.contains("-eDP-") || name.contains("-LVDS-")) {
+                continue;
+            }
+            let base = entry.path();
+            let enabled = fs::read_to_string(base.join("enabled"))
+                .map(|s| s.trim() == "enabled")
+                .unwrap_or(false);
+            let connected = fs::read_to_string(base.join("status"))
+                .map(|s| s.trim() == "connected")
+                .unwrap_or(false);
+            if !(enabled && connected) {
+                continue;
+            }
+            let dpms = base.join("dpms");
+            if fs::metadata(&dpms).is_ok() {
+                out.push(dpms.to_string_lossy().to_string());
+            }
         }
+        out
+    }
+
+    /// True when the panel is in any kind of off / blanked state. We check
+    /// two sources because they don't always agree:
+    ///   1. `bl_power` (legacy fbdev): non-zero ⇒ off.
+    ///   2. DRM connector `dpms`: anything other than "On" ⇒ off.
+    /// Either saying off is treated as off. Missing files mean "no opinion".
+    fn is_powered_off(&self) -> bool {
+        if let Some(p) = &self.bl_power_path {
+            if let Ok(s) = fs::read_to_string(p) {
+                if s.trim().parse::<u32>().map(|v| v != 0).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+        for p in &self.dpms_paths {
+            if let Ok(s) = fs::read_to_string(p) {
+                if !s.trim().eq_ignore_ascii_case("on") {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Backlight level as a 0.0–1.0 fraction.
@@ -2080,26 +2132,66 @@ mod tests {
         let bl = BacklightSensor {
             brightness_path: None,
             bl_power_path: None,
+            dpms_paths: vec![],
             max_brightness: 100,
         };
         assert_eq!(bl.estimated_watts(), None);
     }
 
     #[test]
-    fn backlight_powered_off_returns_none() {
-        // Construct a sensor pointing at a tmp file with bl_power=4.
+    fn backlight_powered_off_via_bl_power() {
         let dir = std::env::temp_dir();
-        let bp = dir.join("wattaouille_test_bl_power");
+        let bp = dir.join("wattaouille_test_bl_power_4");
         std::fs::write(&bp, "4\n").unwrap();
-        let bp_path = bp.to_string_lossy().to_string();
-        let br = dir.join("wattaouille_test_brightness");
+        let br = dir.join("wattaouille_test_brightness_4");
         std::fs::write(&br, "1000\n").unwrap();
         let bl = BacklightSensor {
             brightness_path: Some(br.to_string_lossy().to_string()),
-            bl_power_path: Some(bp_path),
+            bl_power_path: Some(bp.to_string_lossy().to_string()),
+            dpms_paths: vec![],
             max_brightness: 1000,
         };
         assert_eq!(bl.estimated_watts(), None);
+    }
+
+    #[test]
+    fn backlight_powered_off_via_drm_dpms() {
+        // bl_power says On but DRM dpms says Off — the modern
+        // (XFCE blank-screen / xset dpms) path. Should still return None.
+        let dir = std::env::temp_dir();
+        let bp = dir.join("wattaouille_test_bl_power_on");
+        std::fs::write(&bp, "0\n").unwrap();
+        let br = dir.join("wattaouille_test_brightness_on");
+        std::fs::write(&br, "1000\n").unwrap();
+        let dpms = dir.join("wattaouille_test_dpms_off");
+        std::fs::write(&dpms, "Off\n").unwrap();
+        let bl = BacklightSensor {
+            brightness_path: Some(br.to_string_lossy().to_string()),
+            bl_power_path: Some(bp.to_string_lossy().to_string()),
+            dpms_paths: vec![dpms.to_string_lossy().to_string()],
+            max_brightness: 1000,
+        };
+        assert_eq!(bl.estimated_watts(), None);
+    }
+
+    #[test]
+    fn backlight_on_when_both_say_on() {
+        let dir = std::env::temp_dir();
+        let bp = dir.join("wattaouille_test_bl_power_both_on");
+        std::fs::write(&bp, "0\n").unwrap();
+        let br = dir.join("wattaouille_test_brightness_both_on");
+        std::fs::write(&br, "500\n").unwrap();
+        let dpms = dir.join("wattaouille_test_dpms_on");
+        std::fs::write(&dpms, "On\n").unwrap();
+        let bl = BacklightSensor {
+            brightness_path: Some(br.to_string_lossy().to_string()),
+            bl_power_path: Some(bp.to_string_lossy().to_string()),
+            dpms_paths: vec![dpms.to_string_lossy().to_string()],
+            max_brightness: 1000,
+        };
+        // 500/1000 = 50% → 0.5 + 3.0*0.5 = 2.0 W
+        let w = bl.estimated_watts().unwrap();
+        assert!((w - 2.0).abs() < 1e-9);
     }
 
     // ── Wi-Fi radio estimate ─────────────────────────────────────────

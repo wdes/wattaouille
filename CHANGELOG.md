@@ -6,6 +6,26 @@ Versioning](https://semver.org/).
 
 ## Unreleased
 
+## v1.3.5
+
+### Fixed
+- **Display still showed `~1.4 W (30% bl)` when the backlight was off
+  via the desktop's blank-screen / DPMS-off button.** Cause: XFCE's
+  power manager (and `xset dpms force off`, GNOME's blank, etc.) flips
+  the modern DRM connector DPMS state at
+  `/sys/class/drm/card<N>-eDP-<M>/dpms`, but doesn't necessarily touch
+  the legacy framebuffer `bl_power` file. v1.3.1 only checked
+  `bl_power`, so the panel reading kept reporting on.
+
+  `BacklightSensor::detect()` now also enumerates
+  `/sys/class/drm/*-eDP-*/` and `/sys/class/drm/*-LVDS-*/` connectors
+  that are `enabled` + `connected`, captures their `dpms` paths, and
+  treats anything other than `On` as off. Either source saying off
+  hides the 🖥 line.
+
+### Tests
+- `+2` (DRM-DPMS-off path, both-on baseline). 51 total.
+
 ## v1.3.4
 
 ### Added
