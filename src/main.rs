@@ -1222,6 +1222,7 @@ Options:
   -i, --interval <MS>   Sampling interval in milliseconds [default: 1500]
   -n, --rows <N>        Total rows budget per frame       [default: 50]
       --no-power        Force wattage off (test the new-user fallback path)
+  -V, --version         Print version and exit
   -h, --help            Show this help and exit
 
 Columns (leaderboard):
@@ -1260,6 +1261,10 @@ Press Ctrl+C to quit."
 fn main() -> io::Result<()> {
     install_signal_handlers();
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("wattaouille v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         let prog = args
             .first()
@@ -1621,7 +1626,8 @@ fn main() -> io::Result<()> {
         // Line 4: non-CPU breakdown (display, Wi-Fi radio, network, drift).
         writeln!(
             out,
-            "wattaouille — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked · Ctrl+C to quit",
+            "wattaouille v{} — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked · Ctrl+C to quit",
+            env!("CARGO_PKG_VERSION"),
             interval_ms,
             cpus,
             cur_snap.len(),

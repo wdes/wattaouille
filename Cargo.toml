@@ -1,6 +1,6 @@
 [package]
 name = "wattaouille"
-version = "1.3.3"
+version = "1.3.4"
 edition = "2024"
 description = "Live CPU and energy monitor for Linux laptops — finds what's spinning your fan and how many watts it's burning"
 license = "MPL-2.0"

@@ -6,6 +6,13 @@ Versioning](https://semver.org/).
 
 ## Unreleased
 
+## v1.3.4
+
+### Added
+- Version string in the live header:
+  `wattaouille v1.3.4 — 1500 ms · 12 CPU(s) · …`
+- `-V` / `--version` flag prints the version and exits.
+
 ## v1.3.3
 
 ### Fixed
