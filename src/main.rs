@@ -5,6 +5,20 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
+/// Install a Ctrl+C / SIGTERM handler that restores the terminal state
+/// (exits the alt screen and reshows the cursor) before exiting. Without
+/// this, a default SIGINT terminates the process before we get to send
+/// the restore escape sequences, leaving the terminal in a state where
+/// typed text isn't visible.
+fn install_signal_handlers() {
+    let _ = ctrlc::set_handler(|| {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"\x1B[?1049l\x1B[?25h\r\n");
+        let _ = stdout.flush();
+        std::process::exit(130);
+    });
+}
+
 struct Sample {
     comm: String,
     cmdline_args: Vec<String>,
@@ -78,6 +92,180 @@ fn is_guake(sample: &Sample) -> bool {
             .cmdline_args
             .iter()
             .any(|a| a.ends_with("/guake") || a == "guake")
+}
+
+/// Friendly labels for processes whose comm alone identifies them, plus a few
+/// argv-aware shortcuts that turn long unreadable command lines into a clean
+/// human-readable name. Returns None when no rule matches; the caller falls
+/// through to the generic basename+args formatting.
+fn pretty_known(sample: &Sample) -> Option<String> {
+    // /proc/[pid]/comm is truncated at 15 chars (TASK_COMM_LEN-1), so a few of
+    // these match prefixes of the original program name.
+    let by_comm: &str = match sample.comm.as_str() {
+        // Desktop / window manager
+        "xfdesktop" => "Xfce desktop",
+        "xfce4-panel" => "Xfce panel",
+        "xfce4-session" => "Xfce session",
+        "xfwm4" => "Xfwm window manager",
+        "xfsettingsd" => "Xfce settings daemon",
+        "xfce4-power-mana" => "Xfce power manager",
+        "xfce4-clipman" => "Xfce clipman",
+        "xfce4-screensav" => "Xfce screensaver",
+        "xfconfd" => "Xfce config daemon",
+        "Thunar" => "Thunar (file manager)",
+        "lightdm" => "LightDM",
+        "Xorg" => "Xorg",
+        // Input methods
+        "ibus-daemon" => "IBus daemon",
+        "ibus-ui-gtk3" => "IBus UI (gtk3)",
+        "ibus-engine-sim" => "IBus engine (simple)",
+        "ibus-extension-" => "IBus extension (gtk3)",
+        "ibus-x11" => "IBus X11 bridge",
+        // Audio
+        "pipewire" => "PipeWire",
+        "pipewire-pulse" => "PipeWire (pulse compat)",
+        "wireplumber" => "WirePlumber",
+        "pulseaudio" => "PulseAudio",
+        // System bus / journal
+        "dbus-daemon" => "dbus-daemon",
+        "systemd-journal" => "systemd-journald",
+        "systemd-logind" => "systemd-logind",
+        "systemd-udevd" => "systemd-udevd",
+        // Daemons the user runs
+        "dockerd" => "Docker daemon",
+        "containerd" => "containerd",
+        "redis-server" => "Redis",
+        "teamviewerd" => "TeamViewer daemon",
+        "scdaemon" => "GnuPG scdaemon",
+        "ntp-daemon" => "NTP daemon",
+        "warp-taskbar" => "Cloudflare WARP",
+        "NetworkManager" => "NetworkManager",
+        "ModemManager" => "ModemManager",
+        "bluetoothd" => "BlueZ (bluetoothd)",
+        "tailscaled" => "Tailscale daemon",
+        "wpa_supplicant" => "wpa_supplicant",
+        "avahi-daemon" => "Avahi (mDNS)",
+        // System service daemons
+        "accounts-daemon" => "AccountsService",
+        "polkitd" => "polkitd",
+        "udisksd" => "UDisks2",
+        "upowerd" => "UPower",
+        "colord" => "ColorD (color profiles)",
+        "rtkit-daemon" => "RTKit",
+        "snapd" => "snapd",
+        "cupsd" => "CUPS daemon",
+        "cups-browsed" => "CUPS browser",
+        "smartd" => "S.M.A.R.T daemon",
+        "boltd" => "BoltD (Thunderbolt)",
+        "xiccd" => "X ICC daemon (color)",
+        "yubikey-touch-d" => "YubiKey touch detector",
+        // Truncated to 15 chars by /proc — the trailing dash/character is real
+        "power-profiles-" => "Power Profiles daemon",
+        "xdg-desktop-por" => "XDG Desktop Portal",
+        "xdg-document-po" => "XDG Document Portal",
+        "xdg-permission-" => "XDG Permission Store",
+        "switcheroo-cont" => "switcheroo (GPU offload)",
+        "at-spi-bus-laun" => "AT-SPI bus launcher",
+        "at-spi2-registr" => "AT-SPI registry",
+        // Containers / sandboxes
+        "rootlesskit" => "rootlesskit",
+        "slirp4netns" => "slirp4netns",
+        // Servers I run
+        "caddy" => "Caddy",
+        "apache2" => "Apache HTTPd",
+        "crowdsec" => "CrowdSec",
+        "anydesk" => "AnyDesk",
+        // Login
+        "agetty" => "agetty (TTY login)",
+        // Solaar (Logitech)
+        "solaar" => "Solaar (Logitech)",
+        // Blueman (no path involved here, just the comm)
+        "blueman-tray" => "Blueman (tray)",
+        "blueman-applet" => "Blueman (applet)",
+        // Smartgit launcher script
+        "smartgit.sh" => "SmartGit (launcher)",
+        _ => "",
+    };
+    if !by_comm.is_empty() {
+        return Some(by_comm.to_string());
+    }
+
+    // containerd-shim-runc-v2 — comm is truncated to "containerd-shim". Pull
+    // the container ID out of argv and show a short hash so multiple shims
+    // are easy to tell apart at a glance.
+    if sample.comm.starts_with("containerd-shim") {
+        let mut iter = sample.cmdline_args.iter();
+        let mut id: Option<&str> = None;
+        while let Some(a) = iter.next() {
+            if a == "-id" || a == "--id" {
+                if let Some(next) = iter.next() {
+                    id = Some(next.as_str());
+                    break;
+                }
+            }
+        }
+        let short: String = id
+            .map(|s| s.chars().take(8).collect())
+            .unwrap_or_default();
+        return Some(if short.is_empty() {
+            "containerd-shim".to_string()
+        } else {
+            format!("containerd-shim ({short})")
+        });
+    }
+
+    // wrapper-2.0 plugins for the Xfce panel: argv carries the .so path; the
+    // plugin's library basename is the human name we want.
+    if sample.comm == "wrapper-2.0" {
+        let plugin = sample.cmdline_args.iter().find_map(|a| {
+            if a.contains("/xfce4/panel/plugins/lib") && a.ends_with(".so") {
+                let base = a.rsplit('/').next()?;
+                Some(
+                    base.trim_start_matches("lib")
+                        .trim_end_matches(".so")
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        });
+        return Some(match plugin {
+            Some(p) => format!("Xfce panel plugin ({p})"),
+            None => "Xfce panel plugin".to_string(),
+        });
+    }
+
+    // Blueman tray apps: launched as `python3 /usr/bin/blueman-tray`.
+    if matches!(sample.comm.as_str(), "python3" | "python") {
+        if let Some(blue) = sample
+            .cmdline_args
+            .iter()
+            .find(|a| a.contains("/blueman-"))
+        {
+            let base = blue.rsplit('/').next().unwrap_or(blue);
+            let kind = base.trim_start_matches("blueman-");
+            return Some(format!("Blueman ({kind})"));
+        }
+    }
+
+    // Angular CLI dev server: `node …/ng serve --port=4200 …`
+    if sample.comm == "node" || sample.comm == "ng" {
+        if sample.cmdline_args.iter().any(|a| a == "ng" || a.ends_with("/ng"))
+            && sample.cmdline_args.iter().any(|a| a == "serve")
+        {
+            let port = sample.cmdline_args.iter().find_map(|a| {
+                a.strip_prefix("--port=")
+                    .map(String::from)
+                    .or_else(|| a.strip_prefix("-p=").map(String::from))
+            });
+            return Some(match port {
+                Some(p) => format!("ng serve (:{p})"),
+                None => "ng serve".to_string(),
+            });
+        }
+    }
+
+    None
 }
 
 /// The `node …/happy/dist/index.mjs <cmd>` wrapper script (or its launcher
@@ -157,6 +345,9 @@ fn pretty_cmdline(pid: u32, sample: &Sample, snap: &HashMap<u32, Sample>) -> Str
             Some(folder) if folder != "/" => format!("{} ({folder})", sample.comm),
             _ => sample.comm.clone(),
         };
+    }
+    if let Some(label) = pretty_known(sample) {
+        return label;
     }
     if sample.cmdline_args.is_empty() {
         return format!("[{}]", sample.comm);
@@ -701,6 +892,7 @@ Press Ctrl+C to quit."
 }
 
 fn main() -> io::Result<()> {
+    install_signal_handlers();
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         let prog = args
@@ -962,20 +1154,20 @@ fn main() -> io::Result<()> {
                 non_cpu_w, non_cpu_wh, non_cpu_j, drift_pct
             ));
         }
-        let power_summary = if bits.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", bits.join(" · "))
-        };
+        // Two-line header: program/runtime stats on line 1, energy bits on
+        // line 2. Keeps each line under terminal width and the Ctrl+C hint
+        // visible even when the energy line gets long.
         writeln!(
             out,
-            "wattaouille — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked{} · Ctrl+C to quit",
+            "wattaouille — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked · Ctrl+C to quit",
             interval_ms,
             cpus,
             cur_snap.len(),
-            session_secs,
-            power_summary
+            session_secs
         )?;
+        if !bits.is_empty() {
+            writeln!(out, "{}", bits.join(" · "))?;
+        }
         if !power.enabled {
             writeln!(
                 out,
@@ -1283,9 +1475,9 @@ mod tests {
     #[test]
     fn guake_label() {
         let s = mk("python3", &["/usr/bin/python3", "/usr/bin/guake"]);
-        let snap = snap(vec![(1, s)]);
+        let snap_ = snap(vec![(1, s)]);
         assert_eq!(
-            pretty_cmdline(1, snap.get(&1).unwrap(), &snap),
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
             "Guake terminal"
         );
     }
@@ -1293,9 +1485,9 @@ mod tests {
     #[test]
     fn mysqld_label_with_cwd() {
         let s = mk_cwd("mysqld", &["mysqld", "--sql_mode="], "/var/lib/mysql/projA");
-        let snap = snap(vec![(1, s)]);
+        let snap_ = snap(vec![(1, s)]);
         assert_eq!(
-            pretty_cmdline(1, snap.get(&1).unwrap(), &snap),
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
             "mysqld (projA)"
         );
     }
@@ -1392,6 +1584,138 @@ mod tests {
             .collect();
         let visible = flatten_visible(&[1], &snap, &deltas, &children, &subtree);
         assert_eq!(visible, vec![1]);
+    }
+
+    // ── pretty_known: desktop / daemon labels ────────────────────────
+    fn pretty_solo(s: Sample) -> String {
+        let snap = snap(vec![(1, s)]);
+        pretty_cmdline(1, snap.get(&1).unwrap(), &snap)
+    }
+
+    #[test]
+    fn xfce_desktop_labels() {
+        assert_eq!(
+            pretty_solo(mk("xfdesktop", &["xfdesktop", "--display", ":0.0"])),
+            "Xfce desktop"
+        );
+        assert_eq!(
+            pretty_solo(mk("xfce4-panel", &["xfce4-panel", "--display", ":0.0"])),
+            "Xfce panel"
+        );
+        assert_eq!(
+            pretty_solo(mk("xfwm4", &["xfwm4", "--display", ":0.0"])),
+            "Xfwm window manager"
+        );
+    }
+
+    #[test]
+    fn ibus_labels() {
+        let s = mk("ibus-daemon", &["ibus-daemon", "--daemonize", "--xim"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "IBus daemon"
+        );
+    }
+
+    #[test]
+    fn pipewire_labels() {
+        let s = mk("pipewire-pulse", &["/usr/bin/pipewire-pulse"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "PipeWire (pulse compat)"
+        );
+    }
+
+    #[test]
+    fn dockerd_label() {
+        let s = mk("dockerd", &["dockerd", "--config-file=/etc/docker/daemon.json"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Docker daemon"
+        );
+    }
+
+    #[test]
+    fn containerd_shim_with_id() {
+        // comm is truncated to "containerd-shim"; argv carries the long id.
+        let s = mk(
+            "containerd-shim",
+            &[
+                "containerd-shim-runc-v2",
+                "-namespace",
+                "moby",
+                "-id",
+                "abcdef1234567890deadbeef",
+                "-address",
+                "/run/foo",
+            ],
+        );
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "containerd-shim (abcdef12)"
+        );
+    }
+
+    #[test]
+    fn containerd_shim_without_id() {
+        let s = mk("containerd-shim", &["containerd-shim-runc-v2", "--help"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "containerd-shim"
+        );
+    }
+
+    #[test]
+    fn xfce_panel_plugin_named_from_so() {
+        let s = mk(
+            "wrapper-2.0",
+            &[
+                "wrapper-2.0",
+                "/usr/lib/x86_64-linux-gnu/xfce4/panel/plugins/libwhiskermenu.so",
+                "28",
+                "23068679",
+                "whiskermenu",
+            ],
+        );
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Xfce panel plugin (whiskermenu)"
+        );
+    }
+
+    #[test]
+    fn blueman_tray_label() {
+        let s = mk("python3", &["/usr/bin/python3", "/usr/bin/blueman-tray"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Blueman (tray)"
+        );
+    }
+
+    #[test]
+    fn ng_serve_label_with_port() {
+        let s = mk(
+            "node",
+            &[
+                "/usr/bin/node",
+                "/usr/bin/ng",
+                "serve",
+                "--port=4200",
+                "--host=0.0.0.0",
+            ],
+        );
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "ng serve (:4200)"
+        );
     }
 
     #[test]

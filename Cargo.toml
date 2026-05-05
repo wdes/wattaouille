@@ -1,6 +1,6 @@
 [package]
 name = "wattaouille"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 description = "Live CPU and energy monitor for Linux laptops — finds what's spinning your fan and how many watts it's burning"
 license = "MIT"
@@ -11,3 +11,7 @@ name = "wattaouille"
 path = "src/main.rs"
 
 [dependencies]
+# Clean Ctrl+C / SIGTERM handler so we can restore the terminal state
+# (alt screen exit + cursor show) on interrupt instead of leaving the user
+# stuck with an invisible cursor / no echo.
+ctrlc = { version = "3.4", features = ["termination"] }
