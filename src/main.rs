@@ -648,6 +648,8 @@ fn main() -> io::Result<()> {
     // Battery vs RAPL drift accounting — only accumulates while discharging.
     let mut bat_joules: f64 = 0.0;
     let mut rapl_joules_while_discharging: f64 = 0.0;
+    let mut discharging_secs: f64 = 0.0;
+    let mut elapsed_secs: f64 = 0.0;
 
     // Session-cumulative jiffies per PID (resets only on program restart) so heavy
     // hitters don't disappear between frames just because they idled briefly.
@@ -687,11 +689,13 @@ fn main() -> io::Result<()> {
         let interval_secs = interval_ms as f64 / 1000.0;
         let frame_watts = frame_joules / interval_secs;
         total_joules += frame_joules;
+        elapsed_secs += interval_secs;
 
         // Sample battery draw (only meaningful while on battery).
         let bat_watts = battery.watts_now();
         let discharging = battery.discharging();
         if discharging {
+            discharging_secs += interval_secs;
             if let Some(w) = bat_watts {
                 bat_joules += w * interval_secs;
                 if power.enabled {
@@ -812,11 +816,24 @@ fn main() -> io::Result<()> {
         let session_secs = (cumulative_total as f64) / (cpus as f64 * 100.0); // rough, jiffies are 1/100s on Linux
         let mut bits: Vec<String> = Vec::new();
         if power.enabled {
-            bits.push(format!("⚡ RAPL {:.1} W ({:.0} J)", frame_watts, total_joules));
+            // Average wattage over the whole session: total energy / time.
+            // The per-frame instantaneous reading is still in the NOW W column
+            // of the leaderboard.
+            let avg_w = if elapsed_secs > 0.0 {
+                total_joules / elapsed_secs
+            } else {
+                frame_watts
+            };
+            bits.push(format!("⚡ RAPL {:.1} W ({:.0} J)", avg_w, total_joules));
         }
         if discharging {
-            if let Some(w) = bat_watts {
-                bits.push(format!("🔋 BAT {:.1} W ({:.0} J)", w, bat_joules));
+            if let Some(_w) = bat_watts {
+                let bat_avg_w = if discharging_secs > 0.0 {
+                    bat_joules / discharging_secs
+                } else {
+                    0.0
+                };
+                bits.push(format!("🔋 BAT {:.1} W ({:.0} J)", bat_avg_w, bat_joules));
             }
         } else if battery.power_now_path.is_some() {
             bits.push("🔌 on AC".to_string());
