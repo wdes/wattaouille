@@ -173,6 +173,66 @@ fn total_cpu_jiffies() -> u64 {
         .sum()
 }
 
+/// Reads Intel RAPL package-0 energy counters. The kernel exposes them under
+/// `/sys/class/powercap/intel-rapl:0/energy_uj` as a free-running microjoule
+/// counter; the difference between two reads divided by the interval gives
+/// average watts. The file is mode 0400 (root-only) since the Platypus
+/// side-channel disclosure, so we degrade gracefully when not readable.
+struct PowerSensor {
+    energy_path: String,
+    max_uj: u64,
+    enabled: bool,
+    disabled_reason: Option<String>,
+}
+
+impl PowerSensor {
+    const PATH: &'static str = "/sys/class/powercap/intel-rapl:0/energy_uj";
+    const WRAP_PATH: &'static str = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
+
+    fn detect() -> Self {
+        let max_uj = fs::read_to_string(Self::WRAP_PATH)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        match fs::read_to_string(Self::PATH) {
+            Ok(_) => Self {
+                energy_path: Self::PATH.to_string(),
+                max_uj,
+                enabled: true,
+                disabled_reason: None,
+            },
+            Err(e) => Self {
+                energy_path: Self::PATH.to_string(),
+                max_uj,
+                enabled: false,
+                disabled_reason: Some(e.to_string()),
+            },
+        }
+    }
+
+    fn read_uj(&self) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        fs::read_to_string(&self.energy_path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Returns joules consumed between `before` and `after`, handling the
+    /// counter wrap at `max_uj`.
+    fn joules_between(&self, before: u64, after: u64) -> f64 {
+        let delta_uj = if after >= before {
+            after - before
+        } else {
+            self.max_uj.saturating_sub(before).saturating_add(after)
+        };
+        delta_uj as f64 / 1_000_000.0
+    }
+}
+
 fn num_cpus() -> u64 {
     let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
     stat.lines()
@@ -404,11 +464,24 @@ Columns (leaderboard):
   PID     Process ID (or the collapse-root PID for browser subtrees)
   AVG%    Cumulative CPU usage since start, as % of one core
   NOW%    This frame's CPU usage, as % of one core
+  NOW W   Estimated watts this frame (this proc's CPU share × package power)
+  TOTAL J Cumulative joules consumed by this proc since start
 Columns (live tree):
   PID     Process ID
   %CPU    Share of total system CPU during the sample
   %CORE   `top`-style percent of one core (= %CPU × num_cpus)
   TREE    `[<browser>, N procs]` = whole browser subtree folded.
+
+Wattage:
+  Total package wattage is read from Intel RAPL (`/sys/class/powercap/
+  intel-rapl:0/energy_uj`). Per-process watts are estimated by scaling the
+  package total by each process's CPU share. RAPL files are root-only by
+  default; to enable wattage as your user run:
+
+    sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj
+
+  Or run `monitor` with sudo. When wattage is unavailable monitor still
+  works — only the W and J columns are hidden.
 
 Press Ctrl+C to quit."
     );
@@ -441,6 +514,11 @@ fn main() -> io::Result<()> {
     let mut prev_total = total_cpu_jiffies();
     let mut prev_snap = snapshot();
 
+    let power = PowerSensor::detect();
+    let mut prev_energy_uj = power.read_uj();
+    let mut cumulative_joules: HashMap<u32, f64> = HashMap::new();
+    let mut total_joules: f64 = 0.0;
+
     // Session-cumulative jiffies per PID (resets only on program restart) so heavy
     // hitters don't disappear between frames just because they idled briefly.
     let mut cumulative: HashMap<u32, u64> = HashMap::new();
@@ -459,7 +537,16 @@ fn main() -> io::Result<()> {
 
         let cur_total = total_cpu_jiffies();
         let cur_snap = snapshot();
+        let cur_energy_uj = power.read_uj();
         let total_delta = cur_total.saturating_sub(prev_total).max(1);
+
+        // Joules spent across the whole CPU package during the sample.
+        let frame_joules = match (prev_energy_uj, cur_energy_uj) {
+            (Some(b), Some(a)) => power.joules_between(b, a),
+            _ => 0.0,
+        };
+        let frame_watts = frame_joules / (interval_ms as f64 / 1000.0);
+        total_joules += frame_joules;
 
         let mut deltas: HashMap<u32, u64> = HashMap::with_capacity(cur_snap.len());
         for (pid, after) in &cur_snap {
@@ -480,10 +567,15 @@ fn main() -> io::Result<()> {
         for (pid, d) in &deltas {
             if *d > 0 {
                 *cumulative.entry(*pid).or_insert(0) += d;
+                if frame_joules > 0.0 {
+                    let share = *d as f64 / total_delta as f64;
+                    *cumulative_joules.entry(*pid).or_insert(0.0) += frame_joules * share;
+                }
             }
         }
         // Drop entries for PIDs that no longer exist; they're not actionable.
         cumulative.retain(|pid, _| cur_snap.contains_key(pid));
+        cumulative_joules.retain(|pid, _| cur_snap.contains_key(pid));
 
         let subtree: HashMap<u32, u64> = cur_snap
             .keys()
@@ -566,22 +658,46 @@ fn main() -> io::Result<()> {
         // Home + clear (in alt screen buffer).
         write!(out, "\x1B[H\x1B[2J")?;
         let session_secs = (cumulative_total as f64) / (cpus as f64 * 100.0); // rough, jiffies are 1/100s on Linux
+        let power_summary = if power.enabled {
+            format!(" · ⚡ {:.1} W ({:.0} J total)", frame_watts, total_joules)
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "monitor — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked · Ctrl+C to quit",
+            "monitor — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked{} · Ctrl+C to quit",
             interval_ms,
             cpus,
             cur_snap.len(),
-            session_secs
+            session_secs,
+            power_summary
         )?;
+        if !power.enabled {
+            writeln!(
+                out,
+                "⚠ Wattage disabled ({}). Enable: sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj",
+                power
+                    .disabled_reason
+                    .as_deref()
+                    .unwrap_or("RAPL not readable")
+            )?;
+        }
 
         // ── Section 1: Session leaderboard ────────────────────────────────
         writeln!(out, "\nSESSION TOP CONSUMERS  (cumulative since program start)")?;
-        writeln!(
-            out,
-            "{:>7}  {:>7}  {:>7}  {}",
-            "PID", "AVG%", "NOW%", "COMMAND"
-        )?;
+        if power.enabled {
+            writeln!(
+                out,
+                "{:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
+                "PID", "AVG%", "NOW%", "NOW W", "TOTAL J", "COMMAND"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "{:>7}  {:>7}  {:>7}  {}",
+                "PID", "AVG%", "NOW%", "COMMAND"
+            )?;
+        }
         for (pid, cum, now) in board.iter().take(leaderboard_n) {
             let Some(sample) = cur_snap.get(pid) else { continue };
             let avg_pct_core =
@@ -592,10 +708,39 @@ fn main() -> io::Result<()> {
                 let (descendants, _) = count_descendants(*pid, &children, &deltas);
                 label = format!("[{}, {} procs] {}", sample.comm, descendants + 1, label);
             }
-            let line_prefix = format!(
-                "{:>7}  {:>6.1}%  {:>6.1}%  ",
-                pid, avg_pct_core, now_pct_core
-            );
+            let line_prefix = if power.enabled {
+                let now_w = if total_delta > 0 {
+                    frame_watts * (*now as f64 / total_delta as f64)
+                } else {
+                    0.0
+                };
+                let total_j = if is_collapse_root(sample) {
+                    // Sum descendants too so the browser line matches the
+                    // jiffies aggregation it already uses.
+                    let mut s = cumulative_joules.get(pid).copied().unwrap_or(0.0);
+                    let mut stack = vec![*pid];
+                    while let Some(p) = stack.pop() {
+                        if let Some(kids) = children.get(&p) {
+                            for &c in kids {
+                                s += cumulative_joules.get(&c).copied().unwrap_or(0.0);
+                                stack.push(c);
+                            }
+                        }
+                    }
+                    s
+                } else {
+                    cumulative_joules.get(pid).copied().unwrap_or(0.0)
+                };
+                format!(
+                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>6.2}W  {:>6.1}J  ",
+                    pid, avg_pct_core, now_pct_core, now_w, total_j
+                )
+            } else {
+                format!(
+                    "{:>7}  {:>6.1}%  {:>6.1}%  ",
+                    pid, avg_pct_core, now_pct_core
+                )
+            };
             let budget = cols.saturating_sub(line_prefix.chars().count()).max(10);
             let label_trunc: String = label.chars().take(budget).collect();
             writeln!(out, "{line_prefix}{label_trunc}")?;
@@ -638,5 +783,6 @@ fn main() -> io::Result<()> {
 
         prev_total = cur_total;
         prev_snap = cur_snap;
+        prev_energy_uj = cur_energy_uj;
     }
 }
