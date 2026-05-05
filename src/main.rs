@@ -583,8 +583,8 @@ Columns (leaderboard):
   PID     Process ID (or the collapse-root PID for browser subtrees)
   AVG%    Cumulative CPU usage since start, as % of one core
   NOW%    This frame's CPU usage, as % of one core
-  NOW W   Estimated watts this frame (this proc's CPU share × package power)
-  TOTAL J Cumulative joules consumed by this proc since start
+  NOW W       Estimated watts this frame (proc's CPU share × package power)
+  TOTAL W (J) Cumulative average wattage and total joules since start
 Columns (live tree):
   PID     Process ID
   %CPU    Share of total system CPU during the sample
@@ -878,8 +878,8 @@ fn main() -> io::Result<()> {
         if power.enabled {
             writeln!(
                 out,
-                "{:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
-                "PID", "AVG%", "NOW%", "NOW W", "TOTAL J", "COMMAND"
+                "{:>7}  {:>7}  {:>7}  {:>7}  {:>16}  {}",
+                "PID", "AVG%", "NOW%", "NOW W", "TOTAL W (J)", "COMMAND"
             )?;
         } else {
             writeln!(
@@ -921,9 +921,15 @@ fn main() -> io::Result<()> {
                 } else {
                     cumulative_joules.get(pid).copied().unwrap_or(0.0)
                 };
+                let total_w = if elapsed_secs > 0.0 {
+                    total_j / elapsed_secs
+                } else {
+                    0.0
+                };
+                let total_cell = format!("{:.2}W ({:.0}J)", total_w, total_j);
                 format!(
-                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>6.2}W  {:>6.1}J  ",
-                    pid, avg_pct_core, now_pct_core, now_w, total_j
+                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>6.2}W  {:>16}  ",
+                    pid, avg_pct_core, now_pct_core, now_w, total_cell
                 )
             } else {
                 format!(
