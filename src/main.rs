@@ -32,6 +32,24 @@ struct Sample {
     ppid: u32,
     cpu_jiffies: u64,
     cwd: Option<String>,
+    /// Sum of `read_bytes` + `write_bytes` from /proc/[pid]/io. None when the
+    /// kernel denied the read (other users' processes or insufficient ptrace).
+    io_bytes: Option<u64>,
+}
+
+/// Parse `/proc/[pid]/io`-style content and return read_bytes + write_bytes.
+/// Bytes here are "actually went through the block I/O subsystem", post-cache.
+fn parse_proc_io(text: &str) -> u64 {
+    let mut rb: u64 = 0;
+    let mut wb: u64 = 0;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("read_bytes:") {
+            rb = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("write_bytes:") {
+            wb = v.trim().parse().unwrap_or(0);
+        }
+    }
+    rb.saturating_add(wb)
 }
 
 fn read_proc_stat(pid: &str) -> Option<Sample> {
@@ -56,12 +74,19 @@ fn read_proc_stat(pid: &str) -> Option<Sample> {
         .ok()
         .and_then(|p| p.to_str().map(String::from));
 
+    // /proc/[pid]/io is mode 0400 owned by the process owner, plus restricted
+    // by ptrace policy. Reads of other users' processes return EACCES.
+    let io_bytes = fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()
+        .map(|s| parse_proc_io(&s));
+
     Some(Sample {
         comm,
         cmdline_args,
         ppid,
         cpu_jiffies: utime + stime,
         cwd,
+        io_bytes,
     })
 }
 
@@ -191,6 +216,14 @@ fn pretty_known(sample: &Sample) -> Option<String> {
         "blueman-applet" => "Blueman (applet)",
         // Smartgit launcher script
         "smartgit.sh" => "SmartGit (launcher)",
+        "slack" => "Slack desktop",
+        "Slack" => "Slack desktop",
+        "discord" => "Discord",
+        "Discord" => "Discord",
+        "code" => "VS Code",
+        "Code" => "VS Code",
+        "spotify" => "Spotify",
+        "thunderbird" => "Thunderbird",
         _ => "",
     };
     if !by_comm.is_empty() {
@@ -510,6 +543,176 @@ impl BatterySensor {
     }
 }
 
+/// Reads the panel backlight fraction from /sys/class/backlight/*/brightness.
+/// Display draw isn't reported in watts anywhere; we estimate it from the
+/// backlight level using the typical envelope of a 14"/15" laptop panel:
+/// ~0.5 W at 0% backlight (LCD electronics + always-on backlight floor) and
+/// ~3.5 W at 100% (full LED current). Linear interpolation in between.
+struct BacklightSensor {
+    brightness_path: Option<String>,
+    max_brightness: u64,
+}
+
+impl BacklightSensor {
+    /// Watts at the lowest backlight level (panel electronics, minimum LED).
+    const BASE_W: f64 = 0.5;
+    /// Watts at full backlight (LED bar at maximum current).
+    const MAX_W: f64 = 3.5;
+
+    fn detect() -> Self {
+        if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
+            for entry in entries.flatten() {
+                let p = entry.path().join("brightness");
+                let mp = entry.path().join("max_brightness");
+                if fs::read_to_string(&p).is_ok() {
+                    let max: u64 = fs::read_to_string(&mp)
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(1);
+                    return Self {
+                        brightness_path: Some(p.to_string_lossy().to_string()),
+                        max_brightness: max.max(1),
+                    };
+                }
+            }
+        }
+        Self {
+            brightness_path: None,
+            max_brightness: 1,
+        }
+    }
+
+    /// Backlight level as a 0.0–1.0 fraction.
+    fn fraction(&self) -> Option<f64> {
+        let cur: u64 = fs::read_to_string(self.brightness_path.as_ref()?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((cur as f64) / (self.max_brightness as f64))
+    }
+
+    fn estimated_watts(&self) -> Option<f64> {
+        let f = self.fraction()?.clamp(0.0, 1.0);
+        Some(Self::BASE_W + (Self::MAX_W - Self::BASE_W) * f)
+    }
+}
+
+/// Tracks network interface counters and classifies each interface as
+/// wireless or wired. Sums up rx+tx bytes across all non-loopback ifaces.
+struct NetSensor {
+    ifaces: Vec<NetIface>,
+}
+
+#[allow(dead_code)]
+struct NetIface {
+    name: String, // kept for future per-iface display, currently unused
+    rx_path: String,
+    tx_path: String,
+    operstate_path: String,
+    is_wireless: bool,
+}
+
+#[derive(Default)]
+struct NetReadout {
+    rx_bytes_total: u64,
+    tx_bytes_total: u64,
+    rx_bytes_wireless: u64,
+    tx_bytes_wireless: u64,
+    wireless_associated: bool,
+}
+
+impl NetSensor {
+    fn detect() -> Self {
+        let mut ifaces = Vec::new();
+        let Ok(entries) = fs::read_dir("/sys/class/net") else {
+            return Self { ifaces };
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == "lo" {
+                continue;
+            }
+            let base = format!("/sys/class/net/{name}");
+            // A wireless interface exposes either a `wireless/` directory or
+            // a `phy80211` symlink.
+            let is_wireless = fs::metadata(format!("{base}/wireless")).is_ok()
+                || fs::metadata(format!("{base}/phy80211")).is_ok();
+            ifaces.push(NetIface {
+                name: name.to_string(),
+                rx_path: format!("{base}/statistics/rx_bytes"),
+                tx_path: format!("{base}/statistics/tx_bytes"),
+                operstate_path: format!("{base}/operstate"),
+                is_wireless,
+            });
+        }
+        Self { ifaces }
+    }
+
+    fn read(&self) -> NetReadout {
+        let mut out = NetReadout::default();
+        for i in &self.ifaces {
+            let rx = fs::read_to_string(&i.rx_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let tx = fs::read_to_string(&i.tx_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            out.rx_bytes_total = out.rx_bytes_total.saturating_add(rx);
+            out.tx_bytes_total = out.tx_bytes_total.saturating_add(tx);
+            if i.is_wireless {
+                out.rx_bytes_wireless = out.rx_bytes_wireless.saturating_add(rx);
+                out.tx_bytes_wireless = out.tx_bytes_wireless.saturating_add(tx);
+                let up = fs::read_to_string(&i.operstate_path)
+                    .map(|s| s.trim().eq_ignore_ascii_case("up"))
+                    .unwrap_or(false);
+                out.wireless_associated = out.wireless_associated || up;
+            }
+        }
+        out
+    }
+
+    fn has_wireless(&self) -> bool {
+        self.ifaces.iter().any(|i| i.is_wireless)
+    }
+}
+
+/// Estimate Wi-Fi radio power from throughput. There's no kernel-exposed
+/// per-radio wattage on consumer hardware; this is a coarse model.
+///
+///   not associated → 0 W (radio idle/off)
+///   associated, idle traffic → 0.7 W (RX listen + occasional beacons)
+///   ramps linearly to ~2.5 W at 5 MB/s aggregated rx+tx
+fn estimate_wifi_radio_watts(associated: bool, throughput_bytes_per_sec: f64) -> f64 {
+    if !associated {
+        return 0.0;
+    }
+    const IDLE_W: f64 = 0.7;
+    const HEAVY_W: f64 = 2.5;
+    const HEAVY_THRESHOLD_BPS: f64 = 5.0 * 1024.0 * 1024.0; // 5 MB/s
+    let f = (throughput_bytes_per_sec / HEAVY_THRESHOLD_BPS).clamp(0.0, 1.0);
+    IDLE_W + (HEAVY_W - IDLE_W) * f
+}
+
+/// Format a byte rate in human-friendly units.
+fn fmt_byte_rate(bps: f64) -> String {
+    if !bps.is_finite() || bps < 1.0 {
+        return "0 B/s".to_string();
+    }
+    if bps < 1024.0 {
+        format!("{:.0} B/s", bps)
+    } else if bps < 1024.0 * 1024.0 {
+        format!("{:.1} KB/s", bps / 1024.0)
+    } else if bps < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", bps / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2} GB/s", bps / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
 /// Format a duration in hours as "Xh Ym".
 fn fmt_hours(h: f64) -> String {
     if !h.is_finite() || h < 0.0 {
@@ -517,6 +720,33 @@ fn fmt_hours(h: f64) -> String {
     }
     let total_min = (h * 60.0).round() as u64;
     format!("{}h {:02}m", total_min / 60, total_min % 60)
+}
+
+/// One RAPL energy domain: package, core, uncore, or dram. Each is its own
+/// free-running µJ counter with its own wraparound point.
+struct RaplDomain {
+    label: String,
+    energy_path: String,
+    max_uj: u64,
+}
+
+impl RaplDomain {
+    fn read_uj(&self) -> Option<u64> {
+        fs::read_to_string(&self.energy_path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn joules_between(&self, before: u64, after: u64) -> f64 {
+        let delta_uj = if after >= before {
+            after - before
+        } else {
+            self.max_uj.saturating_sub(before).saturating_add(after)
+        };
+        delta_uj as f64 / 1_000_000.0
+    }
 }
 
 /// Reads Intel RAPL package-0 energy counters. The kernel exposes them under
@@ -529,6 +759,10 @@ struct PowerSensor {
     max_uj: u64,
     enabled: bool,
     disabled_reason: Option<String>,
+    /// Subdomains: `core`, `uncore` (iGPU + ring + LLC), `dram` (RAM
+    /// controller). Same chmod gates them all; if package is readable, the
+    /// subdomains usually are too.
+    subdomains: Vec<RaplDomain>,
 }
 
 impl PowerSensor {
@@ -547,20 +781,62 @@ impl PowerSensor {
                 max_uj,
                 enabled: false,
                 disabled_reason: Some("forced off via --no-power".to_string()),
+                subdomains: vec![],
             };
         }
         match fs::read_to_string(Self::PATH) {
-            Ok(_) => Self {
-                energy_path: Self::PATH.to_string(),
-                max_uj,
-                enabled: true,
-                disabled_reason: None,
-            },
+            Ok(_) => {
+                // Discover subdomains under intel-rapl:0:* that are readable.
+                let mut subdomains = Vec::new();
+                if let Ok(entries) = fs::read_dir("/sys/class/powercap") {
+                    let mut paths: Vec<String> = entries
+                        .flatten()
+                        .filter_map(|e| {
+                            let n = e.file_name();
+                            let n = n.to_str()?;
+                            // intel-rapl:0:0, intel-rapl:0:1, ...
+                            if n.starts_with("intel-rapl:0:") {
+                                Some(format!("/sys/class/powercap/{n}"))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    paths.sort();
+                    for path in paths {
+                        let label = fs::read_to_string(format!("{path}/name"))
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        let energy_path = format!("{path}/energy_uj");
+                        if fs::read_to_string(&energy_path).is_err() {
+                            continue;
+                        }
+                        let max = fs::read_to_string(format!("{path}/max_energy_range_uj"))
+                            .ok()
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(u64::MAX);
+                        subdomains.push(RaplDomain {
+                            label,
+                            energy_path,
+                            max_uj: max,
+                        });
+                    }
+                }
+                Self {
+                    energy_path: Self::PATH.to_string(),
+                    max_uj,
+                    enabled: true,
+                    disabled_reason: None,
+                    subdomains,
+                }
+            }
             Err(e) => Self {
                 energy_path: Self::PATH.to_string(),
                 max_uj,
                 enabled: false,
                 disabled_reason: Some(format!("{e}")),
+                subdomains: vec![],
             },
         }
     }
@@ -929,7 +1205,14 @@ fn main() -> io::Result<()> {
 
     let power = PowerSensor::detect(force_no_power);
     let battery = BatterySensor::detect();
+    let backlight = BacklightSensor::detect();
+    let net = NetSensor::detect();
     let mut prev_energy_uj = power.read_uj();
+    // Per-subdomain previous readings (core, uncore, dram).
+    let mut prev_subdomain_uj: Vec<Option<u64>> =
+        power.subdomains.iter().map(|d| d.read_uj()).collect();
+    // Per-subdomain cumulative joules for the session.
+    let mut subdomain_joules: Vec<f64> = vec![0.0; power.subdomains.len()];
     let mut cumulative_joules: HashMap<u32, f64> = HashMap::new();
     let mut total_joules: f64 = 0.0;
     // Battery vs RAPL drift accounting — only accumulates while discharging.
@@ -937,6 +1220,20 @@ fn main() -> io::Result<()> {
     let mut rapl_joules_while_discharging: f64 = 0.0;
     let mut discharging_secs: f64 = 0.0;
     let mut elapsed_secs: f64 = 0.0;
+    // Per-PID I/O delta tracking and session totals.
+    let mut prev_io: HashMap<u32, u64> = HashMap::new();
+    let mut cumulative_io: HashMap<u32, u64> = HashMap::new();
+    let initial_net = net.read();
+    let mut net_prev_total: u64 = initial_net.rx_bytes_total + initial_net.tx_bytes_total;
+    let mut net_prev_wireless: u64 =
+        initial_net.rx_bytes_wireless + initial_net.tx_bytes_wireless;
+    let mut display_joules: f64 = 0.0;
+    let mut wifi_joules: f64 = 0.0;
+    for (pid, sample) in &prev_snap {
+        if let Some(b) = sample.io_bytes {
+            prev_io.insert(*pid, b);
+        }
+    }
 
     // Session-cumulative jiffies per PID (resets only on program restart) so heavy
     // hitters don't disappear between frames just because they idled briefly.
@@ -966,6 +1263,8 @@ fn main() -> io::Result<()> {
         let cur_total = total_cpu_jiffies();
         let cur_snap = snapshot();
         let cur_energy_uj = power.read_uj();
+        let cur_subdomain_uj: Vec<Option<u64>> =
+            power.subdomains.iter().map(|d| d.read_uj()).collect();
         let total_delta = cur_total.saturating_sub(prev_total).max(1);
 
         // Joules spent across the whole CPU package during the sample.
@@ -973,10 +1272,47 @@ fn main() -> io::Result<()> {
             (Some(b), Some(a)) => power.joules_between(b, a),
             _ => 0.0,
         };
+        // Per-subdomain joules + cumulative.
+        let mut frame_subdomain_joules: Vec<f64> = vec![0.0; power.subdomains.len()];
+        for (i, dom) in power.subdomains.iter().enumerate() {
+            if let (Some(b), Some(a)) = (prev_subdomain_uj[i], cur_subdomain_uj[i]) {
+                let j = dom.joules_between(b, a);
+                frame_subdomain_joules[i] = j;
+                subdomain_joules[i] += j;
+            }
+        }
         let interval_secs = interval_ms as f64 / 1000.0;
         let frame_watts = frame_joules / interval_secs;
         total_joules += frame_joules;
         elapsed_secs += interval_secs;
+
+        // Network throughput across all non-loopback ifaces.
+        let net_now = net.read();
+        let net_total_now = net_now.rx_bytes_total + net_now.tx_bytes_total;
+        let net_wireless_now = net_now.rx_bytes_wireless + net_now.tx_bytes_wireless;
+        let net_total_bps =
+            net_total_now.saturating_sub(net_prev_total) as f64 / interval_secs;
+        let net_wireless_bps =
+            net_wireless_now.saturating_sub(net_prev_wireless) as f64 / interval_secs;
+        net_prev_total = net_total_now;
+        net_prev_wireless = net_wireless_now;
+
+        // Display + Wi-Fi radio energy estimates accumulated for the session.
+        let display_w = backlight.estimated_watts();
+        if let Some(w) = display_w {
+            display_joules += w * interval_secs;
+        }
+        let wifi_w = if net.has_wireless() {
+            Some(estimate_wifi_radio_watts(
+                net_now.wireless_associated,
+                net_wireless_bps,
+            ))
+        } else {
+            None
+        };
+        if let Some(w) = wifi_w {
+            wifi_joules += w * interval_secs;
+        }
 
         // Sample battery draw (only meaningful while on battery).
         let bat_watts = battery.watts_now();
@@ -999,6 +1335,25 @@ fn main() -> io::Result<()> {
             };
             deltas.insert(*pid, d);
         }
+
+        // Per-PID I/O byte deltas. /proc/[pid]/io is permission-restricted, so
+        // many entries will be None — we skip those silently.
+        let mut io_deltas: HashMap<u32, u64> = HashMap::new();
+        let mut next_prev_io: HashMap<u32, u64> = HashMap::new();
+        for (pid, sample) in &cur_snap {
+            if let Some(now) = sample.io_bytes {
+                next_prev_io.insert(*pid, now);
+                if let Some(before) = prev_io.get(pid) {
+                    let d = now.saturating_sub(*before);
+                    if d > 0 {
+                        io_deltas.insert(*pid, d);
+                        *cumulative_io.entry(*pid).or_insert(0) += d;
+                    }
+                }
+            }
+        }
+        prev_io = next_prev_io;
+        cumulative_io.retain(|pid, _| cur_snap.contains_key(pid));
 
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (pid, sample) in &cur_snap {
@@ -1112,9 +1467,20 @@ fn main() -> io::Result<()> {
                 frame_watts
             };
             let total_wh = total_joules / 3600.0;
+            // Subdomain "now" watts breakdown.
+            let mut sub: Vec<String> = Vec::new();
+            for (i, dom) in power.subdomains.iter().enumerate() {
+                let w = frame_subdomain_joules[i] / interval_secs;
+                sub.push(format!("{} {:.1}W", dom.label, w));
+            }
+            let sub_str = if sub.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", sub.join(" · "))
+            };
             bits.push(format!(
-                "⚡ RAPL {:.1} W avg · {:.3} Wh ({:.0} J)",
-                avg_w, total_wh, total_joules
+                "⚡ RAPL {:.1} W avg{} · {:.3} Wh ({:.0} J)",
+                avg_w, sub_str, total_wh, total_joules
             ));
         }
         if discharging {
@@ -1161,9 +1527,9 @@ fn main() -> io::Result<()> {
                 non_cpu_w, non_cpu_wh, non_cpu_j, drift_pct
             ));
         }
-        // Two-line header: program/runtime stats on line 1, energy bits on
-        // line 2. Keeps each line under terminal width and the Ctrl+C hint
-        // visible even when the energy line gets long.
+        // Multi-line header. Line 1: runtime stats + Ctrl+C hint. Line 2:
+        // CPU package energy. Line 3 (when on battery): battery + drift.
+        // Line 4: non-CPU breakdown (display, Wi-Fi radio, network, drift).
         writeln!(
             out,
             "wattaouille — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked · Ctrl+C to quit",
@@ -1174,6 +1540,35 @@ fn main() -> io::Result<()> {
         )?;
         if !bits.is_empty() {
             writeln!(out, "{}", bits.join(" · "))?;
+        }
+
+        // Non-CPU line: display-watt estimate, Wi-Fi radio estimate, total
+        // network throughput. All present-only-when-available so the line
+        // doesn't render at all on a headless or wired-only box.
+        let mut non_cpu_bits: Vec<String> = Vec::new();
+        if let Some(w) = display_w {
+            let pct = backlight.fraction().unwrap_or(0.0) * 100.0;
+            let total_wh = display_joules / 3600.0;
+            // `~` prefix flags this as a model-based estimate, not a sensor read.
+            non_cpu_bits.push(format!(
+                "🖥 ~{:.1} W ({:.0}% bl · ~{:.3} Wh)",
+                w, pct, total_wh
+            ));
+        }
+        if let Some(w) = wifi_w {
+            let total_wh = wifi_joules / 3600.0;
+            non_cpu_bits.push(format!(
+                "📡 Wi-Fi ~{:.1} W ({} · ~{:.3} Wh)",
+                w,
+                fmt_byte_rate(net_wireless_bps),
+                total_wh
+            ));
+        }
+        if net_total_bps > 1.0 {
+            non_cpu_bits.push(format!("📶 net {}", fmt_byte_rate(net_total_bps)));
+        }
+        if !non_cpu_bits.is_empty() {
+            writeln!(out, "{}", non_cpu_bits.join(" · "))?;
         }
         if !power.enabled {
             writeln!(
@@ -1191,14 +1586,14 @@ fn main() -> io::Result<()> {
         if power.enabled {
             writeln!(
                 out,
-                "{:>7}  {:>7}  {:>7}  {:>7}  {:>16}  {}",
-                "PID", "AVG%", "NOW%", "NOW W", "TOTAL W (J)", "COMMAND"
+                "{:>7}  {:>7}  {:>7}  {:>7}  {:>16}  {:>10}  {}",
+                "PID", "AVG%", "NOW%", "NOW W", "TOTAL W (J)", "I/O", "COMMAND"
             )?;
         } else {
             writeln!(
                 out,
-                "{:>7}  {:>7}  {:>7}  {}",
-                "PID", "AVG%", "NOW%", "COMMAND"
+                "{:>7}  {:>7}  {:>7}  {:>10}  {}",
+                "PID", "AVG%", "NOW%", "I/O", "COMMAND"
             )?;
         }
         for (pid, cum, now) in board.iter().take(leaderboard_n) {
@@ -1211,6 +1606,31 @@ fn main() -> io::Result<()> {
                 let (descendants, _) = count_descendants(*pid, &children, &deltas);
                 label = format!("[{}, {} procs] {}", sample.comm, descendants + 1, label);
             }
+            // I/O delta this frame, summed across the subtree for collapse roots.
+            let io_now_bps = {
+                let raw = if is_collapse_root(sample) {
+                    let mut s = io_deltas.get(pid).copied().unwrap_or(0);
+                    let mut stack = vec![*pid];
+                    while let Some(p) = stack.pop() {
+                        if let Some(kids) = children.get(&p) {
+                            for &c in kids {
+                                s = s.saturating_add(io_deltas.get(&c).copied().unwrap_or(0));
+                                stack.push(c);
+                            }
+                        }
+                    }
+                    s
+                } else {
+                    io_deltas.get(pid).copied().unwrap_or(0)
+                };
+                raw as f64 / interval_secs.max(0.001)
+            };
+            let io_cell = if io_now_bps >= 1.0 {
+                fmt_byte_rate(io_now_bps)
+            } else {
+                "—".to_string()
+            };
+
             let line_prefix = if power.enabled {
                 let now_w = if total_delta > 0 {
                     frame_watts * (*now as f64 / total_delta as f64)
@@ -1241,13 +1661,13 @@ fn main() -> io::Result<()> {
                 };
                 let total_cell = format!("{:.2}W ({:.0}J)", total_w, total_j);
                 format!(
-                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>6.2}W  {:>16}  ",
-                    pid, avg_pct_core, now_pct_core, now_w, total_cell
+                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>6.2}W  {:>16}  {:>10}  ",
+                    pid, avg_pct_core, now_pct_core, now_w, total_cell, io_cell
                 )
             } else {
                 format!(
-                    "{:>7}  {:>6.1}%  {:>6.1}%  ",
-                    pid, avg_pct_core, now_pct_core
+                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>10}  ",
+                    pid, avg_pct_core, now_pct_core, io_cell
                 )
             };
             let budget = cols.saturating_sub(line_prefix.chars().count()).max(10);
@@ -1293,6 +1713,7 @@ fn main() -> io::Result<()> {
         prev_total = cur_total;
         prev_snap = cur_snap;
         prev_energy_uj = cur_energy_uj;
+        prev_subdomain_uj = cur_subdomain_uj;
     }
 }
 
@@ -1307,6 +1728,7 @@ mod tests {
             ppid: 0,
             cpu_jiffies: 0,
             cwd: None,
+            io_bytes: None,
         }
     }
 
@@ -1514,6 +1936,7 @@ mod tests {
             max_uj: 1_000_000_000,
             enabled: false,
             disabled_reason: None,
+            subdomains: vec![],
         };
         // 5 J = 5_000_000 µJ
         assert!((p.joules_between(1_000_000, 6_000_000) - 5.0).abs() < 1e-9);
@@ -1526,9 +1949,84 @@ mod tests {
             max_uj: 100,
             enabled: false,
             disabled_reason: None,
+            subdomains: vec![],
         };
         // before=95, after=10: counter wrapped, true delta = (100-95) + 10 = 15
         assert!((p.joules_between(95, 10) - 15.0 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rapl_domain_joules_wraparound() {
+        let d = RaplDomain {
+            label: "core".to_string(),
+            energy_path: "x".to_string(),
+            max_uj: 100,
+        };
+        assert!((d.joules_between(95, 10) - 15.0 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    // ── /proc/[pid]/io parsing ──────────────────────────────────────
+    #[test]
+    fn parse_io_sums_read_and_write() {
+        let text = "rchar: 999\nwchar: 1\nsyscr: 5\nsyscw: 3\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
+        assert_eq!(parse_proc_io(text), 4096 + 8192);
+    }
+
+    #[test]
+    fn parse_io_handles_missing_fields() {
+        // Some kernel configs omit read_bytes/write_bytes.
+        let text = "rchar: 100\nwchar: 0\n";
+        assert_eq!(parse_proc_io(text), 0);
+    }
+
+    // ── Backlight estimate ───────────────────────────────────────────
+    #[test]
+    fn backlight_watts_at_zero_is_baseline() {
+        let bl = BacklightSensor {
+            brightness_path: None,
+            max_brightness: 100,
+        };
+        // No path means estimated_watts() returns None.
+        assert_eq!(bl.estimated_watts(), None);
+    }
+
+    // ── Wi-Fi radio estimate ─────────────────────────────────────────
+    #[test]
+    fn wifi_radio_zero_when_not_associated() {
+        assert_eq!(estimate_wifi_radio_watts(false, 1024.0 * 1024.0), 0.0);
+    }
+
+    #[test]
+    fn wifi_radio_idle_when_associated() {
+        let w = estimate_wifi_radio_watts(true, 0.0);
+        assert!((w - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wifi_radio_clamps_at_heavy_traffic() {
+        // 50 MB/s is way above the 5 MB/s threshold; should clamp to MAX.
+        let w = estimate_wifi_radio_watts(true, 50.0 * 1024.0 * 1024.0);
+        assert!((w - 2.5).abs() < 1e-6);
+    }
+
+    // ── Byte-rate formatter ──────────────────────────────────────────
+    #[test]
+    fn fmt_byte_rate_units() {
+        assert_eq!(fmt_byte_rate(0.0), "0 B/s");
+        assert_eq!(fmt_byte_rate(512.0), "512 B/s");
+        assert_eq!(fmt_byte_rate(2.0 * 1024.0), "2.0 KB/s");
+        assert_eq!(fmt_byte_rate(3.5 * 1024.0 * 1024.0), "3.5 MB/s");
+    }
+
+    // ── Slack and friends ────────────────────────────────────────────
+    #[test]
+    fn slack_label() {
+        let s = mk("slack", &["/usr/bin/slack"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Slack desktop"
+        );
     }
 
     // ── Battery time formatter ───────────────────────────────────────
