@@ -10,6 +10,7 @@ struct Sample {
     cmdline_args: Vec<String>,
     ppid: u32,
     cpu_jiffies: u64,
+    cwd: Option<String>,
 }
 
 fn read_proc_stat(pid: &str) -> Option<Sample> {
@@ -30,12 +31,24 @@ fn read_proc_stat(pid: &str) -> Option<Sample> {
         .map(String::from)
         .collect();
 
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .and_then(|p| p.to_str().map(String::from));
+
     Some(Sample {
         comm,
         cmdline_args,
         ppid,
         cpu_jiffies: utime + stime,
+        cwd,
     })
+}
+
+fn cwd_basename(sample: &Sample) -> Option<&str> {
+    sample
+        .cwd
+        .as_deref()
+        .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()))
 }
 
 fn is_claude_code(sample: &Sample) -> bool {
@@ -53,6 +66,28 @@ fn is_smartgit(sample: &Sample) -> bool {
         .cmdline_args
         .iter()
         .any(|a| a.contains("/smartgit/") || a.ends_with("/smartgit.sh"))
+}
+
+/// The `node …/happy/dist/index.mjs <cmd>` wrapper script (or its launcher
+/// shim under `happy/scripts/`). Returns the sub-command (`claude`, `daemon`,
+/// …) so we can distinguish daemons from session wrappers.
+fn happy_subcommand(sample: &Sample) -> Option<&str> {
+    let mut args = sample.cmdline_args.iter();
+    let _argv0 = args.next()?;
+    let mut script = None;
+    let mut subcmd = None;
+    for arg in args {
+        if script.is_none() {
+            if arg.contains("/happy/dist/") || arg.contains("/happy/scripts/") {
+                script = Some(arg);
+            }
+        } else {
+            subcmd = Some(arg.as_str());
+            break;
+        }
+    }
+    script?;
+    Some(subcmd.unwrap_or(""))
 }
 
 /// True if any ancestor (via real ppid in /proc) was launched through Happy.
@@ -82,10 +117,19 @@ fn ancestor_via_happy(pid: u32, snap: &HashMap<u32, Sample>) -> bool {
 /// get a much shorter label (with "(Happy)" if launched via Happy).
 fn pretty_cmdline(pid: u32, sample: &Sample, snap: &HashMap<u32, Sample>) -> String {
     if is_claude_code(sample) {
-        return if ancestor_via_happy(pid, snap) {
-            "Claude Code (Happy)".to_string()
-        } else {
-            "Claude Code".to_string()
+        let happy = ancestor_via_happy(pid, snap);
+        return match (happy, cwd_basename(sample)) {
+            (true, Some(folder)) => format!("Claude Code (Happy: {folder})"),
+            (true, None) => "Claude Code (Happy)".to_string(),
+            (false, Some(folder)) => format!("Claude Code ({folder})"),
+            (false, None) => "Claude Code".to_string(),
+        };
+    }
+    if let Some(subcmd) = happy_subcommand(sample) {
+        return match (subcmd, cwd_basename(sample)) {
+            ("daemon", _) => "Happy daemon".to_string(),
+            (_, Some(folder)) => format!("Happy ({folder})"),
+            (_, None) => "Happy".to_string(),
         };
     }
     if is_smartgit(sample) {
