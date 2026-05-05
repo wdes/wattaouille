@@ -550,6 +550,7 @@ impl BatterySensor {
 /// ~3.5 W at 100% (full LED current). Linear interpolation in between.
 struct BacklightSensor {
     brightness_path: Option<String>,
+    bl_power_path: Option<String>,
     max_brightness: u64,
 }
 
@@ -564,6 +565,7 @@ impl BacklightSensor {
             for entry in entries.flatten() {
                 let p = entry.path().join("brightness");
                 let mp = entry.path().join("max_brightness");
+                let bp = entry.path().join("bl_power");
                 if fs::read_to_string(&p).is_ok() {
                     let max: u64 = fs::read_to_string(&mp)
                         .ok()
@@ -571,6 +573,11 @@ impl BacklightSensor {
                         .unwrap_or(1);
                     return Self {
                         brightness_path: Some(p.to_string_lossy().to_string()),
+                        bl_power_path: if fs::metadata(&bp).is_ok() {
+                            Some(bp.to_string_lossy().to_string())
+                        } else {
+                            None
+                        },
                         max_brightness: max.max(1),
                     };
                 }
@@ -578,7 +585,19 @@ impl BacklightSensor {
         }
         Self {
             brightness_path: None,
+            bl_power_path: None,
             max_brightness: 1,
+        }
+    }
+
+    /// True when the kernel says the panel is in any blank/powered-down state
+    /// (any non-zero bl_power value: 1=NORMAL, 2=VSYNC_SUSPEND, 3=HSYNC_SUSPEND,
+    /// 4=POWERDOWN). When the file is missing, assume the panel is on.
+    fn is_powered_off(&self) -> bool {
+        let Some(p) = &self.bl_power_path else { return false };
+        match fs::read_to_string(p) {
+            Ok(s) => s.trim().parse::<u32>().map(|v| v != 0).unwrap_or(false),
+            Err(_) => false,
         }
     }
 
@@ -592,7 +611,12 @@ impl BacklightSensor {
         Some((cur as f64) / (self.max_brightness as f64))
     }
 
+    /// Returns None when the panel is reported off (don't render the line at
+    /// all then) or when no backlight device is exposed.
     fn estimated_watts(&self) -> Option<f64> {
+        if self.is_powered_off() {
+            return None;
+        }
         let f = self.fraction()?.clamp(0.0, 1.0);
         Some(Self::BASE_W + (Self::MAX_W - Self::BASE_W) * f)
     }
@@ -609,7 +633,7 @@ struct NetIface {
     name: String, // kept for future per-iface display, currently unused
     rx_path: String,
     tx_path: String,
-    operstate_path: String,
+    carrier_path: String,
     is_wireless: bool,
 }
 
@@ -643,7 +667,7 @@ impl NetSensor {
                 name: name.to_string(),
                 rx_path: format!("{base}/statistics/rx_bytes"),
                 tx_path: format!("{base}/statistics/tx_bytes"),
-                operstate_path: format!("{base}/operstate"),
+                carrier_path: format!("{base}/carrier"),
                 is_wireless,
             });
         }
@@ -666,10 +690,15 @@ impl NetSensor {
             if i.is_wireless {
                 out.rx_bytes_wireless = out.rx_bytes_wireless.saturating_add(rx);
                 out.tx_bytes_wireless = out.tx_bytes_wireless.saturating_add(tx);
-                let up = fs::read_to_string(&i.operstate_path)
-                    .map(|s| s.trim().eq_ignore_ascii_case("up"))
+                // `carrier` is 1 when the link is up (associated to an AP).
+                // operstate stays "up" even when rfkilled, so it can't tell us
+                // whether the radio is actually on.
+                let linked = fs::read_to_string(&i.carrier_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|v| v == 1)
                     .unwrap_or(false);
-                out.wireless_associated = out.wireless_associated || up;
+                out.wireless_associated = out.wireless_associated || linked;
             }
         }
         out
@@ -1302,11 +1331,11 @@ fn main() -> io::Result<()> {
         if let Some(w) = display_w {
             display_joules += w * interval_secs;
         }
-        let wifi_w = if net.has_wireless() {
-            Some(estimate_wifi_radio_watts(
-                net_now.wireless_associated,
-                net_wireless_bps,
-            ))
+        // Only show a Wi-Fi figure when the radio is actually doing
+        // something: there's a wireless interface AND it has a carrier
+        // (rfkilled / down / unplugged → None, line disappears).
+        let wifi_w = if net.has_wireless() && net_now.wireless_associated {
+            Some(estimate_wifi_radio_watts(true, net_wireless_bps))
         } else {
             None
         };
@@ -1467,11 +1496,13 @@ fn main() -> io::Result<()> {
                 frame_watts
             };
             let total_wh = total_joules / 3600.0;
-            // Subdomain "now" watts breakdown.
+            // Subdomain "now" watts breakdown. Width-stable: 5 chars for the
+            // numeric value (XXX.X / " XX.X" / "  X.X") so the line doesn't
+            // jump as values cross 10 W or 100 W between frames.
             let mut sub: Vec<String> = Vec::new();
             for (i, dom) in power.subdomains.iter().enumerate() {
                 let w = frame_subdomain_joules[i] / interval_secs;
-                sub.push(format!("{} {:.1}W", dom.label, w));
+                sub.push(format!("{} {:>5.1} W", dom.label, w));
             }
             let sub_str = if sub.is_empty() {
                 String::new()
@@ -1479,7 +1510,7 @@ fn main() -> io::Result<()> {
                 format!(" ({})", sub.join(" · "))
             };
             bits.push(format!(
-                "⚡ RAPL {:.1} W avg{} · {:.3} Wh ({:.0} J)",
+                "⚡ RAPL {:>5.1} W avg{} · {:.3} Wh ({:.0} J)",
                 avg_w, sub_str, total_wh, total_joules
             ));
         }
@@ -1492,7 +1523,7 @@ fn main() -> io::Result<()> {
                 };
                 let bat_wh = bat_joules / 3600.0;
                 let mut s = format!(
-                    "🔋 BAT {:.1} W avg · {:.3} Wh ({:.0} J)",
+                    "🔋 BAT {:>5.1} W avg · {:.3} Wh ({:.0} J)",
                     bat_avg_w, bat_wh, bat_joules
                 );
                 if let Some(pct) = battery.percent() {
@@ -1523,7 +1554,7 @@ fn main() -> io::Result<()> {
             };
             let non_cpu_wh = non_cpu_j / 3600.0;
             bits.push(format!(
-                "Δ non-CPU {:+.1} W avg · {:.3} Wh ({:.0} J · {:+.0}%)",
+                "Δ non-CPU {:>+6.1} W avg · {:.3} Wh ({:.0} J · {:+.0}%)",
                 non_cpu_w, non_cpu_wh, non_cpu_j, drift_pct
             ));
         }
@@ -1551,14 +1582,14 @@ fn main() -> io::Result<()> {
             let total_wh = display_joules / 3600.0;
             // `~` prefix flags this as a model-based estimate, not a sensor read.
             non_cpu_bits.push(format!(
-                "🖥 ~{:.1} W ({:.0}% bl · ~{:.3} Wh)",
+                "🖥 ~{:>5.1} W ({:.0}% bl · ~{:.3} Wh)",
                 w, pct, total_wh
             ));
         }
         if let Some(w) = wifi_w {
             let total_wh = wifi_joules / 3600.0;
             non_cpu_bits.push(format!(
-                "📡 Wi-Fi ~{:.1} W ({} · ~{:.3} Wh)",
+                "📡 Wi-Fi ~{:>5.1} W ({} · ~{:.3} Wh)",
                 w,
                 fmt_byte_rate(net_wireless_bps),
                 total_wh
@@ -1981,12 +2012,29 @@ mod tests {
 
     // ── Backlight estimate ───────────────────────────────────────────
     #[test]
-    fn backlight_watts_at_zero_is_baseline() {
+    fn backlight_watts_no_device_returns_none() {
         let bl = BacklightSensor {
             brightness_path: None,
+            bl_power_path: None,
             max_brightness: 100,
         };
-        // No path means estimated_watts() returns None.
+        assert_eq!(bl.estimated_watts(), None);
+    }
+
+    #[test]
+    fn backlight_powered_off_returns_none() {
+        // Construct a sensor pointing at a tmp file with bl_power=4.
+        let dir = std::env::temp_dir();
+        let bp = dir.join("wattaouille_test_bl_power");
+        std::fs::write(&bp, "4\n").unwrap();
+        let bp_path = bp.to_string_lossy().to_string();
+        let br = dir.join("wattaouille_test_brightness");
+        std::fs::write(&br, "1000\n").unwrap();
+        let bl = BacklightSensor {
+            brightness_path: Some(br.to_string_lossy().to_string()),
+            bl_power_path: Some(bp_path),
+            max_brightness: 1000,
+        };
         assert_eq!(bl.estimated_watts(), None);
     }
 
