@@ -2,8 +2,42 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+
+/// The terminal's termios state at startup. We capture it before flipping
+/// stdin into non-canonical / non-echo mode and restore it on Ctrl+C so the
+/// shell isn't left in raw mode if we crash. `OnceLock` is read-only after
+/// the first set, which makes it safe to read from the signal handler thread
+/// without locking.
+static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
+
+/// Disable canonical mode and echo on stdin. Without this, mouse scroll
+/// inside the alt screen sends arrow-key escape sequences (`\x1B[A`,
+/// `\x1B[B`) which the kernel's tty driver echoes straight back into the
+/// alt-screen view as visible garbage.
+fn enter_raw_mode() {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+            return; // not a tty (piped) — nothing to do
+        }
+        let _ = ORIGINAL_TERMIOS.set(t);
+        t.c_lflag &= !(libc::ICANON | libc::ECHO);
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+    }
+}
+
+/// Put stdin back into whatever mode it was in at startup. Safe to call from
+/// the ctrlc handler thread because `OnceLock::get` is lock-free.
+fn restore_terminal_mode() {
+    if let Some(t) = ORIGINAL_TERMIOS.get() {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+        }
+    }
+}
 
 /// Install a Ctrl+C / SIGTERM handler that restores the terminal state
 /// (exits the alt screen and reshows the cursor) before exiting. Without
@@ -19,6 +53,9 @@ fn install_signal_handlers() {
     }
     const RESTORE: &[u8] = b"\x1B[?1049l\x1B[?25h\r\n";
     let _ = ctrlc::set_handler(|| {
+        // Termios first (so the user's prompt has echo back when the alt
+        // screen exits), then alt-screen + cursor escapes, then exit.
+        restore_terminal_mode();
         unsafe {
             let _ = write(1, RESTORE.as_ptr(), RESTORE.len());
         }
@@ -1302,6 +1339,10 @@ fn main() -> io::Result<()> {
     // terminal is restored on Ctrl+C (most terminals reset DECSET on process exit).
     write!(out, "\x1B[?1049h\x1B[?25l\x1B[H\x1B[2J")?;
     out.flush()?;
+    // Disable canonical mode + echo on stdin AFTER the alt screen is up,
+    // so scrolling with the mouse wheel doesn't leak arrow-key escapes
+    // into the displayed buffer.
+    enter_raw_mode();
 
     loop {
         thread::sleep(Duration::from_millis(interval_ms));

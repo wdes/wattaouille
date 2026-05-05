@@ -6,6 +6,18 @@ Versioning](https://semver.org/).
 
 ## Unreleased
 
+## v1.3.3
+
+### Fixed
+- **Mouse-scroll garbage in the alt screen.** Scrolling with the mouse
+  wheel inside the running `wattaouille` translated to arrow-key escape
+  sequences (`\x1B[A`, `\x1B[B`) which the kernel tty driver echoed
+  straight back into the alt-screen view as visible characters
+  ("weird chars"). Now stdin is put in non-canonical / non-echo mode
+  while the alt screen is up, and restored on Ctrl+C alongside the
+  cursor and alt-screen-exit sequences. Adds `libc = "0.2"` as an
+  explicit dep (already pulled in transitively via `ctrlc`).
+
 ## v1.3.2
 
 ### Added
