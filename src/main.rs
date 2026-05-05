@@ -52,13 +52,17 @@ fn cwd_basename(sample: &Sample) -> Option<&str> {
 }
 
 fn is_claude_code(sample: &Sample) -> bool {
-    let head = match sample.cmdline_args.first() {
-        Some(h) => h.as_str(),
-        None => return false,
+    let Some(head) = sample.cmdline_args.first() else {
+        return false;
     };
-    head.ends_with("/claude.exe")
-        || head.ends_with("/claude")
-        || head.contains("@anthropic-ai/claude-code")
+    if head.ends_with("/claude.exe") || head.ends_with("/claude") {
+        return true;
+    }
+    // Sometimes invoked indirectly as `node /path/@anthropic-ai/claude-code/cli.js …`
+    sample
+        .cmdline_args
+        .iter()
+        .any(|a| a.contains("@anthropic-ai/claude-code"))
 }
 
 fn is_smartgit(sample: &Sample) -> bool {
@@ -66,6 +70,14 @@ fn is_smartgit(sample: &Sample) -> bool {
         .cmdline_args
         .iter()
         .any(|a| a.contains("/smartgit/") || a.ends_with("/smartgit.sh"))
+}
+
+fn is_guake(sample: &Sample) -> bool {
+    sample.comm == "guake"
+        || sample
+            .cmdline_args
+            .iter()
+            .any(|a| a.ends_with("/guake") || a == "guake")
 }
 
 /// The `node …/happy/dist/index.mjs <cmd>` wrapper script (or its launcher
@@ -135,6 +147,17 @@ fn pretty_cmdline(pid: u32, sample: &Sample, snap: &HashMap<u32, Sample>) -> Str
     if is_smartgit(sample) {
         return "SmartGit".to_string();
     }
+    if is_guake(sample) {
+        return "Guake terminal".to_string();
+    }
+    // mysqld / mariadbd: the user runs several instances; the cwd usually
+    // points at the data dir, which is the cleanest discriminator.
+    if matches!(sample.comm.as_str(), "mysqld" | "mariadbd") {
+        return match cwd_basename(sample) {
+            Some(folder) if folder != "/" => format!("{} ({folder})", sample.comm),
+            _ => sample.comm.clone(),
+        };
+    }
     if sample.cmdline_args.is_empty() {
         return format!("[{}]", sample.comm);
     }
@@ -181,6 +204,8 @@ fn total_cpu_jiffies() -> u64 {
 struct BatterySensor {
     power_now_path: Option<String>,
     status_path: Option<String>,
+    energy_now_path: Option<String>,
+    energy_full_path: Option<String>,
     ac_online_path: Option<String>,
 }
 
@@ -188,6 +213,8 @@ impl BatterySensor {
     fn detect() -> Self {
         let mut power_now_path = None;
         let mut status_path = None;
+        let mut energy_now_path = None;
+        let mut energy_full_path = None;
         if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -197,6 +224,14 @@ impl BatterySensor {
                     if fs::metadata(&pn).is_ok() && power_now_path.is_none() {
                         power_now_path = Some(pn);
                         status_path = Some(format!("/sys/class/power_supply/{name}/status"));
+                        let en = format!("/sys/class/power_supply/{name}/energy_now");
+                        if fs::metadata(&en).is_ok() {
+                            energy_now_path = Some(en);
+                        }
+                        let ef = format!("/sys/class/power_supply/{name}/energy_full");
+                        if fs::metadata(&ef).is_ok() {
+                            energy_full_path = Some(ef);
+                        }
                     }
                 }
             }
@@ -208,6 +243,8 @@ impl BatterySensor {
         Self {
             power_now_path,
             status_path,
+            energy_now_path,
+            energy_full_path,
             ac_online_path,
         }
     }
@@ -231,6 +268,57 @@ impl BatterySensor {
         }
         false
     }
+
+    /// Hours until battery hits empty at the current draw, computed from
+    /// `energy_now` / `power_now`. Returns None on AC, when readings are
+    /// missing, or when the kernel reports zero draw (briefly possible right
+    /// at unplug, before sysfs settles).
+    fn time_to_empty_hours(&self) -> Option<f64> {
+        if !self.discharging() {
+            return None;
+        }
+        let power_uw: u64 = fs::read_to_string(self.power_now_path.as_ref()?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        if power_uw == 0 {
+            return None;
+        }
+        let energy_uwh: u64 = fs::read_to_string(self.energy_now_path.as_ref()?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(energy_uwh as f64 / power_uw as f64)
+    }
+
+    /// State of charge as a percentage (energy_now / energy_full), 0–100.
+    fn percent(&self) -> Option<f64> {
+        let en: u64 = fs::read_to_string(self.energy_now_path.as_ref()?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let ef: u64 = fs::read_to_string(self.energy_full_path.as_ref()?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        if ef == 0 {
+            return None;
+        }
+        Some(en as f64 / ef as f64 * 100.0)
+    }
+}
+
+/// Format a duration in hours as "Xh Ym".
+fn fmt_hours(h: f64) -> String {
+    if !h.is_finite() || h < 0.0 {
+        return "—".to_string();
+    }
+    let total_min = (h * 60.0).round() as u64;
+    format!("{}h {:02}m", total_min / 60, total_min % 60)
 }
 
 /// Reads Intel RAPL package-0 energy counters. The kernel exposes them under
@@ -324,7 +412,7 @@ impl PowerSensor {
              sudo tee /etc/udev/rules.d/60-rapl-readable.rules\n     \
              sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=powercap\n\n",
         );
-        s.push_str("     # 3. Or just run monitor with sudo.\n");
+        s.push_str("     # 3. Or just run wattaouille with sudo.\n");
         s
     }
 
@@ -595,14 +683,14 @@ Wattage:
   Total package wattage is read from Intel RAPL (`/sys/class/powercap/
   intel-rapl:0/energy_uj`). Per-process watts are estimated by scaling the
   package total by each process's CPU share. RAPL files are root-only by
-  default; when monitor can't read them it prints setup instructions and
+  default; when wattaouille can't read them it prints setup instructions and
   pauses for confirmation, then runs without the W/J columns.
 
   Pass `--no-power` to simulate the disabled path even when RAPL is
   readable — useful for previewing what a new user sees.
 
 Battery cross-check:
-  When discharging, monitor also reads `/sys/class/power_supply/BAT*/
+  When discharging, wattaouille also reads `/sys/class/power_supply/BAT*/
   power_now` and shows BAT watts alongside RAPL watts. The drift figure
   (Δ%) is the share of battery energy NOT accounted for by RAPL — that's
   display, RAM, NVMe, Wi-Fi, etc. Plug back in and the BAT readout
@@ -618,7 +706,7 @@ fn main() -> io::Result<()> {
         let prog = args
             .first()
             .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-            .unwrap_or("monitor");
+            .unwrap_or("wattaouille");
         print_help(prog);
         return Ok(());
     }
@@ -838,22 +926,40 @@ fn main() -> io::Result<()> {
                     0.0
                 };
                 let bat_wh = bat_joules / 3600.0;
-                bits.push(format!(
+                let mut s = format!(
                     "🔋 BAT {:.1} W avg · {:.3} Wh ({:.0} J)",
                     bat_avg_w, bat_wh, bat_joules
-                ));
+                );
+                if let Some(pct) = battery.percent() {
+                    s.push_str(&format!(" · {:.0}%", pct));
+                }
+                if let Some(h) = battery.time_to_empty_hours() {
+                    s.push_str(&format!(" · {} left", fmt_hours(h)));
+                }
+                bits.push(s);
             }
         } else if battery.power_now_path.is_some() {
-            bits.push("🔌 on AC".to_string());
+            let mut s = "🔌 on AC".to_string();
+            if let Some(pct) = battery.percent() {
+                s.push_str(&format!(" · {:.0}%", pct));
+            }
+            bits.push(s);
         }
-        // Show drift only after we've accumulated some data while discharging,
-        // and only if both sensors contributed.
+        // Drift accounting — only meaningful once both sensors have logged a
+        // non-trivial amount of energy while discharging. Show absolute W avg
+        // alongside the % so the user can read the consumption gap as a rate.
         if power.enabled && rapl_joules_while_discharging > 1.0 && bat_joules > 1.0 {
-            let drift = (bat_joules - rapl_joules_while_discharging) / bat_joules * 100.0;
+            let non_cpu_j = bat_joules - rapl_joules_while_discharging;
+            let drift_pct = non_cpu_j / bat_joules * 100.0;
+            let non_cpu_w = if discharging_secs > 0.0 {
+                non_cpu_j / discharging_secs
+            } else {
+                0.0
+            };
+            let non_cpu_wh = non_cpu_j / 3600.0;
             bits.push(format!(
-                "Δ {:+.0}% ({:.0} J non-CPU)",
-                drift,
-                bat_joules - rapl_joules_while_discharging
+                "Δ non-CPU {:+.1} W avg · {:.3} Wh ({:.0} J · {:+.0}%)",
+                non_cpu_w, non_cpu_wh, non_cpu_j, drift_pct
             ));
         }
         let power_summary = if bits.is_empty() {
@@ -863,7 +969,7 @@ fn main() -> io::Result<()> {
         };
         writeln!(
             out,
-            "monitor — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked{} · Ctrl+C to quit",
+            "wattaouille — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked{} · Ctrl+C to quit",
             interval_ms,
             cpus,
             cur_snap.len(),
@@ -988,5 +1094,324 @@ fn main() -> io::Result<()> {
         prev_total = cur_total;
         prev_snap = cur_snap;
         prev_energy_uj = cur_energy_uj;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(comm: &str, args: &[&str]) -> Sample {
+        Sample {
+            comm: comm.to_string(),
+            cmdline_args: args.iter().map(|s| s.to_string()).collect(),
+            ppid: 0,
+            cpu_jiffies: 0,
+            cwd: None,
+        }
+    }
+
+    fn mk_cwd(comm: &str, args: &[&str], cwd: &str) -> Sample {
+        let mut s = mk(comm, args);
+        s.cwd = Some(cwd.to_string());
+        s
+    }
+
+    fn snap(samples: Vec<(u32, Sample)>) -> HashMap<u32, Sample> {
+        samples.into_iter().collect()
+    }
+
+    // ── cwd_basename ─────────────────────────────────────────────────
+    #[test]
+    fn cwd_basename_strips_trailing_slash() {
+        let s = mk_cwd("x", &["x"], "/mnt/Dev/@wdes/wattaouille/");
+        assert_eq!(cwd_basename(&s), Some("wattaouille"));
+    }
+
+    #[test]
+    fn cwd_basename_handles_root() {
+        let s = mk_cwd("x", &["x"], "/");
+        assert_eq!(cwd_basename(&s), None);
+    }
+
+    #[test]
+    fn cwd_basename_none_when_missing() {
+        assert_eq!(cwd_basename(&mk("x", &["x"])), None);
+    }
+
+    // ── is_claude_code / Claude Code labelling ───────────────────────
+    #[test]
+    fn detects_claude_exe_path() {
+        let s = mk(
+            "claude.exe",
+            &[
+                "/home/u/.nvm/versions/node/v22/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+                "--session-id",
+                "abc",
+            ],
+        );
+        assert!(is_claude_code(&s));
+    }
+
+    #[test]
+    fn detects_claude_via_module_path() {
+        let s = mk("node", &["/usr/bin/node", "/path/@anthropic-ai/claude-code/cli.js"]);
+        assert!(is_claude_code(&s));
+    }
+
+    #[test]
+    fn pretty_label_for_claude_with_happy_and_cwd() {
+        // Build a snapshot where a Claude process has a Happy ancestor.
+        let happy_parent = mk(
+            "node",
+            &["/usr/bin/node", "/x/.config/yarn/global/node_modules/happy/dist/index.mjs", "claude"],
+        );
+        let claude = mk_cwd(
+            "claude.exe",
+            &["/usr/local/bin/claude.exe", "--session-id", "abc"],
+            "/mnt/Dev/@wdes/wattaouille",
+        );
+        let mut s = snap(vec![(1, happy_parent), (2, claude)]);
+        s.get_mut(&2).unwrap().ppid = 1;
+        let label = pretty_cmdline(2, s.get(&2).unwrap(), &s);
+        assert_eq!(label, "Claude Code (Happy: wattaouille)");
+    }
+
+    #[test]
+    fn pretty_label_for_claude_without_happy_falls_back_to_plain() {
+        let claude = mk(
+            "claude.exe",
+            &["/usr/local/bin/claude.exe", "--session-id", "abc"],
+        );
+        let s = snap(vec![(1, claude)]);
+        let label = pretty_cmdline(1, s.get(&1).unwrap(), &s);
+        assert_eq!(label, "Claude Code");
+    }
+
+    // ── Happy wrapper detection ──────────────────────────────────────
+    #[test]
+    fn happy_subcommand_finds_claude() {
+        let s = mk(
+            "node",
+            &["/usr/bin/node", "/x/.config/yarn/global/node_modules/happy/dist/index.mjs", "claude"],
+        );
+        assert_eq!(happy_subcommand(&s), Some("claude"));
+    }
+
+    #[test]
+    fn happy_subcommand_finds_daemon() {
+        let s = mk(
+            "node",
+            &["/usr/bin/node", "/x/happy/dist/index.mjs", "daemon", "start-sync"],
+        );
+        assert_eq!(happy_subcommand(&s), Some("daemon"));
+    }
+
+    #[test]
+    fn happy_subcommand_none_for_unrelated() {
+        let s = mk("node", &["/usr/bin/node", "/some/other/script.js"]);
+        assert_eq!(happy_subcommand(&s), None);
+    }
+
+    #[test]
+    fn pretty_label_for_happy_daemon_ignores_cwd() {
+        let s = mk_cwd(
+            "node",
+            &["/usr/bin/node", "/x/happy/dist/index.mjs", "daemon", "start-sync"],
+            "/some/folder",
+        );
+        let snap = snap(vec![(1, s)]);
+        let label = pretty_cmdline(1, snap.get(&1).unwrap(), &snap);
+        assert_eq!(label, "Happy daemon");
+    }
+
+    #[test]
+    fn pretty_label_for_happy_claude_uses_cwd() {
+        let s = mk_cwd(
+            "node",
+            &["/usr/bin/node", "/x/happy/dist/index.mjs", "claude"],
+            "/mnt/Dev/@wdes/wattaouille",
+        );
+        let snap = snap(vec![(1, s)]);
+        let label = pretty_cmdline(1, snap.get(&1).unwrap(), &snap);
+        assert_eq!(label, "Happy (wattaouille)");
+    }
+
+    // ── Browser collapse detection ───────────────────────────────────
+    #[test]
+    fn collapse_main_browser() {
+        let s = mk("librewolf", &["/usr/bin/librewolf", "--sm-client-id", "x"]);
+        assert!(is_collapse_root(&s));
+    }
+
+    #[test]
+    fn dont_collapse_browser_helper_chromium_style() {
+        let s = mk("opera", &["/usr/bin/opera", "--type=renderer", "--lang=fr"]);
+        assert!(!is_collapse_root(&s));
+    }
+
+    #[test]
+    fn dont_collapse_browser_helper_firefox_style() {
+        let s = mk(
+            "librewolf",
+            &["/usr/bin/librewolf", "-contentproc", "-childID", "1"],
+        );
+        assert!(!is_collapse_root(&s));
+    }
+
+    #[test]
+    fn dont_collapse_random_process() {
+        let s = mk("rustc", &["/usr/bin/rustc", "--crate-name", "x"]);
+        assert!(!is_collapse_root(&s));
+    }
+
+    // ── Specialty labels ─────────────────────────────────────────────
+    #[test]
+    fn smartgit_label() {
+        let s = mk(
+            "java",
+            &[
+                "/usr/share/smartgit/jre/bin/java",
+                "-jar",
+                "/usr/share/smartgit/lib/bootloader.jar",
+            ],
+        );
+        let snap = snap(vec![(1, s)]);
+        assert_eq!(pretty_cmdline(1, snap.get(&1).unwrap(), &snap), "SmartGit");
+    }
+
+    #[test]
+    fn guake_label() {
+        let s = mk("python3", &["/usr/bin/python3", "/usr/bin/guake"]);
+        let snap = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap.get(&1).unwrap(), &snap),
+            "Guake terminal"
+        );
+    }
+
+    #[test]
+    fn mysqld_label_with_cwd() {
+        let s = mk_cwd("mysqld", &["mysqld", "--sql_mode="], "/var/lib/mysql/projA");
+        let snap = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap.get(&1).unwrap(), &snap),
+            "mysqld (projA)"
+        );
+    }
+
+    #[test]
+    fn mysqld_label_without_cwd_stays_bare() {
+        let s = mk("mysqld", &["mysqld"]);
+        let snap = snap(vec![(1, s)]);
+        assert_eq!(pretty_cmdline(1, snap.get(&1).unwrap(), &snap), "mysqld");
+    }
+
+    // ── RAPL counter wraparound ──────────────────────────────────────
+    #[test]
+    fn rapl_joules_simple_diff() {
+        let p = PowerSensor {
+            energy_path: PowerSensor::PATH.to_string(),
+            max_uj: 1_000_000_000,
+            enabled: false,
+            disabled_reason: None,
+        };
+        // 5 J = 5_000_000 µJ
+        assert!((p.joules_between(1_000_000, 6_000_000) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rapl_joules_handles_wraparound() {
+        let p = PowerSensor {
+            energy_path: PowerSensor::PATH.to_string(),
+            max_uj: 100,
+            enabled: false,
+            disabled_reason: None,
+        };
+        // before=95, after=10: counter wrapped, true delta = (100-95) + 10 = 15
+        assert!((p.joules_between(95, 10) - 15.0 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    // ── Battery time formatter ───────────────────────────────────────
+    #[test]
+    fn fmt_hours_basic() {
+        assert_eq!(fmt_hours(2.25), "2h 15m");
+        assert_eq!(fmt_hours(0.5), "0h 30m");
+        assert_eq!(fmt_hours(0.0), "0h 00m");
+    }
+
+    #[test]
+    fn fmt_hours_invalid() {
+        assert_eq!(fmt_hours(f64::NAN), "—");
+        assert_eq!(fmt_hours(-1.0), "—");
+    }
+
+    // ── flatten_visible: 0%-CPU middlemen are hidden ─────────────────
+    #[test]
+    fn flatten_promotes_busy_grandchild() {
+        // init (0%) → wrapper (0%) → busy_leaf (1%)
+        let init = mk("init", &["/sbin/init"]);
+        let wrapper = mk("bash", &["/bin/bash"]);
+        let busy = mk("rustc", &["rustc"]);
+        let mut snap = snap(vec![(1, init), (2, wrapper), (3, busy)]);
+        snap.get_mut(&2).unwrap().ppid = 1;
+        snap.get_mut(&3).unwrap().ppid = 2;
+        let mut deltas = HashMap::new();
+        deltas.insert(1, 0u64);
+        deltas.insert(2, 0u64);
+        deltas.insert(3, 100u64);
+        let mut children = HashMap::new();
+        children.insert(0, vec![1]);
+        children.insert(1, vec![2]);
+        children.insert(2, vec![3]);
+        let subtree: HashMap<u32, u64> = snap
+            .keys()
+            .map(|p| (*p, subtree_delta(*p, &deltas, &children)))
+            .collect();
+        let visible = flatten_visible(&[1], &snap, &deltas, &children, &subtree);
+        assert_eq!(visible, vec![3]);
+    }
+
+    #[test]
+    fn flatten_keeps_collapse_root_even_at_zero_own_cpu() {
+        // librewolf (0% own) → contentproc (5%): the librewolf line should
+        // still surface so the browser collapse summary fires.
+        let lw = mk("librewolf", &["/usr/bin/librewolf"]);
+        let helper = mk("librewolf", &["/usr/bin/librewolf", "--type=renderer"]);
+        let mut snap = snap(vec![(1, lw), (2, helper)]);
+        snap.get_mut(&2).unwrap().ppid = 1;
+        let mut deltas = HashMap::new();
+        deltas.insert(1, 0u64);
+        deltas.insert(2, 500u64);
+        let mut children = HashMap::new();
+        children.insert(0, vec![1]);
+        children.insert(1, vec![2]);
+        let subtree: HashMap<u32, u64> = snap
+            .keys()
+            .map(|p| (*p, subtree_delta(*p, &deltas, &children)))
+            .collect();
+        let visible = flatten_visible(&[1], &snap, &deltas, &children, &subtree);
+        assert_eq!(visible, vec![1]);
+    }
+
+    #[test]
+    fn flatten_drops_dead_subtree() {
+        // Both 0%; no descendants busy either. Should disappear entirely.
+        let a = mk("a", &["a"]);
+        let b = mk("b", &["b"]);
+        let mut snap = snap(vec![(1, a), (2, b)]);
+        snap.get_mut(&2).unwrap().ppid = 1;
+        let mut deltas = HashMap::new();
+        deltas.insert(1, 0u64);
+        deltas.insert(2, 0u64);
+        let mut children = HashMap::new();
+        children.insert(0, vec![1]);
+        children.insert(1, vec![2]);
+        let subtree: HashMap<u32, u64> = snap
+            .keys()
+            .map(|p| (*p, subtree_delta(*p, &deltas, &children)))
+            .collect();
+        let visible = flatten_visible(&[1], &snap, &deltas, &children, &subtree);
+        assert!(visible.is_empty());
     }
 }
