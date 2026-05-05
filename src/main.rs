@@ -824,7 +824,11 @@ fn main() -> io::Result<()> {
             } else {
                 frame_watts
             };
-            bits.push(format!("⚡ RAPL {:.1} W ({:.0} J)", avg_w, total_joules));
+            let total_wh = total_joules / 3600.0;
+            bits.push(format!(
+                "⚡ RAPL {:.1} W avg · {:.3} Wh ({:.0} J)",
+                avg_w, total_wh, total_joules
+            ));
         }
         if discharging {
             if let Some(_w) = bat_watts {
@@ -833,7 +837,11 @@ fn main() -> io::Result<()> {
                 } else {
                     0.0
                 };
-                bits.push(format!("🔋 BAT {:.1} W ({:.0} J)", bat_avg_w, bat_joules));
+                let bat_wh = bat_joules / 3600.0;
+                bits.push(format!(
+                    "🔋 BAT {:.1} W avg · {:.3} Wh ({:.0} J)",
+                    bat_avg_w, bat_wh, bat_joules
+                ));
             }
         } else if battery.power_now_path.is_some() {
             bits.push("🔌 on AC".to_string());
