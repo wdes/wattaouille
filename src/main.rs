@@ -7,14 +7,21 @@ use std::time::Duration;
 
 /// Install a Ctrl+C / SIGTERM handler that restores the terminal state
 /// (exits the alt screen and reshows the cursor) before exiting. Without
-/// this, a default SIGINT terminates the process before we get to send
-/// the restore escape sequences, leaving the terminal in a state where
-/// typed text isn't visible.
+/// this, SIGINT either tears down the process with the alt screen still
+/// active (cursor hidden) or — once we hold a stdout lock in the render
+/// loop — deadlocks if the handler also tries to lock stdout. We bypass
+/// the Rust mutex by writing the restore sequence directly via libc::write
+/// to fd 1; that's a single syscall and is safe to call from the ctrlc
+/// crate's handler thread even while main holds the std lock.
 fn install_signal_handlers() {
+    unsafe extern "C" {
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    }
+    const RESTORE: &[u8] = b"\x1B[?1049l\x1B[?25h\r\n";
     let _ = ctrlc::set_handler(|| {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(b"\x1B[?1049l\x1B[?25h\r\n");
-        let _ = stdout.flush();
+        unsafe {
+            let _ = write(1, RESTORE.as_ptr(), RESTORE.len());
+        }
         std::process::exit(130);
     });
 }

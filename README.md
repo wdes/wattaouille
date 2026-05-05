@@ -224,7 +224,9 @@ cases. Run them in CI; they don't touch real sysfs.
 
 ## License
 
-Whatever you want, basically. (Drop a real license file if you fork.)
+[MPL-2.0](LICENSE) — Mozilla Public License v2.0. File-level copyleft:
+you can use wattaouille in proprietary projects, but modifications to
+existing wattaouille files must be shared back under MPL-2.0.
 
 ---
 
