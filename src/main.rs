@@ -173,6 +173,66 @@ fn total_cpu_jiffies() -> u64 {
         .sum()
 }
 
+/// Reads `/sys/class/power_supply/BAT*/power_now` (instantaneous draw in µW)
+/// and the AC adapter online flag, so we can compare it to the RAPL package
+/// total. RAPL only accounts for the CPU package; the battery sees the full
+/// system (display, RAM, NVMe, Wi-Fi, etc.), so BAT will normally exceed RAPL
+/// when discharging, and the gap is "rest-of-system" draw.
+struct BatterySensor {
+    power_now_path: Option<String>,
+    status_path: Option<String>,
+    ac_online_path: Option<String>,
+}
+
+impl BatterySensor {
+    fn detect() -> Self {
+        let mut power_now_path = None;
+        let mut status_path = None;
+        if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with("BAT") {
+                    let pn = format!("/sys/class/power_supply/{name}/power_now");
+                    if fs::metadata(&pn).is_ok() && power_now_path.is_none() {
+                        power_now_path = Some(pn);
+                        status_path = Some(format!("/sys/class/power_supply/{name}/status"));
+                    }
+                }
+            }
+        }
+        let ac_online_path = ["AC", "ACAD", "ADP1"]
+            .iter()
+            .map(|n| format!("/sys/class/power_supply/{n}/online"))
+            .find(|p| fs::metadata(p).is_ok());
+        Self {
+            power_now_path,
+            status_path,
+            ac_online_path,
+        }
+    }
+
+    fn watts_now(&self) -> Option<f64> {
+        let p = self.power_now_path.as_ref()?;
+        let raw: i64 = fs::read_to_string(p).ok()?.trim().parse().ok()?;
+        Some(raw.unsigned_abs() as f64 / 1_000_000.0)
+    }
+
+    fn discharging(&self) -> bool {
+        if let Some(p) = &self.ac_online_path {
+            if let Ok(s) = fs::read_to_string(p) {
+                return s.trim() == "0";
+            }
+        }
+        if let Some(p) = &self.status_path {
+            if let Ok(s) = fs::read_to_string(p) {
+                return s.trim().eq_ignore_ascii_case("Discharging");
+            }
+        }
+        false
+    }
+}
+
 /// Reads Intel RAPL package-0 energy counters. The kernel exposes them under
 /// `/sys/class/powercap/intel-rapl:0/energy_uj` as a free-running microjoule
 /// counter; the difference between two reads divided by the interval gives
@@ -188,12 +248,21 @@ struct PowerSensor {
 impl PowerSensor {
     const PATH: &'static str = "/sys/class/powercap/intel-rapl:0/energy_uj";
     const WRAP_PATH: &'static str = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
+    const DOMAIN_DIR: &'static str = "/sys/class/powercap";
 
-    fn detect() -> Self {
+    fn detect(force_off: bool) -> Self {
         let max_uj = fs::read_to_string(Self::WRAP_PATH)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(u64::MAX);
+        if force_off {
+            return Self {
+                energy_path: Self::PATH.to_string(),
+                max_uj,
+                enabled: false,
+                disabled_reason: Some("forced off via --no-power".to_string()),
+            };
+        }
         match fs::read_to_string(Self::PATH) {
             Ok(_) => Self {
                 energy_path: Self::PATH.to_string(),
@@ -205,9 +274,58 @@ impl PowerSensor {
                 energy_path: Self::PATH.to_string(),
                 max_uj,
                 enabled: false,
-                disabled_reason: Some(e.to_string()),
+                disabled_reason: Some(format!("{e}")),
             },
         }
+    }
+
+    /// Diagnose why the sensor is off and return a multi-line block of
+    /// instructions tailored to whichever cause the kernel reported.
+    fn instructions(&self) -> String {
+        let reason = self
+            .disabled_reason
+            .clone()
+            .unwrap_or_else(|| "unknown".into());
+
+        // What's actually on disk? Helps the user sanity-check before chmod.
+        let rapl_present = fs::metadata("/sys/class/powercap/intel-rapl:0").is_ok();
+        let powercap_present = fs::metadata(Self::DOMAIN_DIR).is_ok();
+
+        let mut s = String::new();
+        s.push_str("⚡ Wattage disabled\n");
+        s.push_str(&format!("   reason: {reason}\n"));
+        if !powercap_present {
+            s.push_str(
+                "   /sys/class/powercap is missing — your kernel was built without\n   \
+                 CONFIG_POWERCAP. No RAPL access is possible on this system.\n",
+            );
+            return s;
+        }
+        if !rapl_present {
+            s.push_str(
+                "   /sys/class/powercap/intel-rapl:0 is missing — likely an AMD or ARM\n   \
+                 CPU. Try `ls /sys/class/powercap` to see what's available; AMD\n   \
+                 systems may expose `amd_energy` instead.\n",
+            );
+            return s;
+        }
+        // RAPL exists but isn't readable — almost always the Platypus mitigation.
+        s.push_str("   RAPL counters exist but are mode 0400 (root-only).\n");
+        s.push_str("   Pick one to enable wattage:\n\n");
+        s.push_str("     # 1. One-shot for this boot:\n");
+        s.push_str(
+            "     sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj \\\n          \
+             /sys/class/powercap/intel-rapl/intel-rapl:0/intel-rapl:0:*/energy_uj\n\n",
+        );
+        s.push_str("     # 2. Persist via udev (survives reboots):\n");
+        s.push_str("     echo 'SUBSYSTEM==\"powercap\", ACTION==\"add\", \\\n");
+        s.push_str(
+            "       RUN+=\"/bin/chmod a+r /sys%p/energy_uj\"' | \\\n         \
+             sudo tee /etc/udev/rules.d/60-rapl-readable.rules\n     \
+             sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=powercap\n\n",
+        );
+        s.push_str("     # 3. Or just run monitor with sudo.\n");
+        s
     }
 
     fn read_uj(&self) -> Option<u64> {
@@ -458,6 +576,7 @@ when launched through the Happy wrapper).
 Options:
   -i, --interval <MS>   Sampling interval in milliseconds [default: 1500]
   -n, --rows <N>        Total rows budget per frame       [default: 50]
+      --no-power        Force wattage off (test the new-user fallback path)
   -h, --help            Show this help and exit
 
 Columns (leaderboard):
@@ -476,12 +595,18 @@ Wattage:
   Total package wattage is read from Intel RAPL (`/sys/class/powercap/
   intel-rapl:0/energy_uj`). Per-process watts are estimated by scaling the
   package total by each process's CPU share. RAPL files are root-only by
-  default; to enable wattage as your user run:
+  default; when monitor can't read them it prints setup instructions and
+  pauses for confirmation, then runs without the W/J columns.
 
-    sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj
+  Pass `--no-power` to simulate the disabled path even when RAPL is
+  readable — useful for previewing what a new user sees.
 
-  Or run `monitor` with sudo. When wattage is unavailable monitor still
-  works — only the W and J columns are hidden.
+Battery cross-check:
+  When discharging, monitor also reads `/sys/class/power_supply/BAT*/
+  power_now` and shows BAT watts alongside RAPL watts. The drift figure
+  (Δ%) is the share of battery energy NOT accounted for by RAPL — that's
+  display, RAM, NVMe, Wi-Fi, etc. Plug back in and the BAT readout
+  switches to `🔌 on AC`.
 
 Press Ctrl+C to quit."
     );
@@ -509,21 +634,35 @@ fn main() -> io::Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
+    let force_no_power = args.iter().any(|a| a == "--no-power");
 
     let cpus = num_cpus();
     let mut prev_total = total_cpu_jiffies();
     let mut prev_snap = snapshot();
 
-    let power = PowerSensor::detect();
+    let power = PowerSensor::detect(force_no_power);
+    let battery = BatterySensor::detect();
     let mut prev_energy_uj = power.read_uj();
     let mut cumulative_joules: HashMap<u32, f64> = HashMap::new();
     let mut total_joules: f64 = 0.0;
+    // Battery vs RAPL drift accounting — only accumulates while discharging.
+    let mut bat_joules: f64 = 0.0;
+    let mut rapl_joules_while_discharging: f64 = 0.0;
 
     // Session-cumulative jiffies per PID (resets only on program restart) so heavy
     // hitters don't disappear between frames just because they idled briefly.
     let mut cumulative: HashMap<u32, u64> = HashMap::new();
     let mut cumulative_total: u64 = 0;
     let leaderboard_n: usize = 8;
+
+    // Print the multi-line setup block ONCE, before entering the alt screen,
+    // so it stays visible in the user's normal scrollback and on Ctrl+C they
+    // can scroll up to copy the chmod / udev commands.
+    if !power.enabled {
+        eprint!("{}", power.instructions());
+        eprintln!("   Press Enter to continue without wattage, or Ctrl+C to abort.");
+        let _ = io::stdin().read_line(&mut String::new());
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -545,8 +684,21 @@ fn main() -> io::Result<()> {
             (Some(b), Some(a)) => power.joules_between(b, a),
             _ => 0.0,
         };
-        let frame_watts = frame_joules / (interval_ms as f64 / 1000.0);
+        let interval_secs = interval_ms as f64 / 1000.0;
+        let frame_watts = frame_joules / interval_secs;
         total_joules += frame_joules;
+
+        // Sample battery draw (only meaningful while on battery).
+        let bat_watts = battery.watts_now();
+        let discharging = battery.discharging();
+        if discharging {
+            if let Some(w) = bat_watts {
+                bat_joules += w * interval_secs;
+                if power.enabled {
+                    rapl_joules_while_discharging += frame_joules;
+                }
+            }
+        }
 
         let mut deltas: HashMap<u32, u64> = HashMap::with_capacity(cur_snap.len());
         for (pid, after) in &cur_snap {
@@ -658,10 +810,31 @@ fn main() -> io::Result<()> {
         // Home + clear (in alt screen buffer).
         write!(out, "\x1B[H\x1B[2J")?;
         let session_secs = (cumulative_total as f64) / (cpus as f64 * 100.0); // rough, jiffies are 1/100s on Linux
-        let power_summary = if power.enabled {
-            format!(" · ⚡ {:.1} W ({:.0} J total)", frame_watts, total_joules)
-        } else {
+        let mut bits: Vec<String> = Vec::new();
+        if power.enabled {
+            bits.push(format!("⚡ RAPL {:.1} W ({:.0} J)", frame_watts, total_joules));
+        }
+        if discharging {
+            if let Some(w) = bat_watts {
+                bits.push(format!("🔋 BAT {:.1} W ({:.0} J)", w, bat_joules));
+            }
+        } else if battery.power_now_path.is_some() {
+            bits.push("🔌 on AC".to_string());
+        }
+        // Show drift only after we've accumulated some data while discharging,
+        // and only if both sensors contributed.
+        if power.enabled && rapl_joules_while_discharging > 1.0 && bat_joules > 1.0 {
+            let drift = (bat_joules - rapl_joules_while_discharging) / bat_joules * 100.0;
+            bits.push(format!(
+                "Δ {:+.0}% ({:.0} J non-CPU)",
+                drift,
+                bat_joules - rapl_joules_while_discharging
+            ));
+        }
+        let power_summary = if bits.is_empty() {
             String::new()
+        } else {
+            format!(" · {}", bits.join(" · "))
         };
         writeln!(
             out,
@@ -675,7 +848,7 @@ fn main() -> io::Result<()> {
         if !power.enabled {
             writeln!(
                 out,
-                "⚠ Wattage disabled ({}). Enable: sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj",
+                "⚠ Wattage disabled ({}). Run with --help for setup.",
                 power
                     .disabled_reason
                     .as_deref()
