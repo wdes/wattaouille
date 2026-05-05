@@ -224,6 +224,9 @@ fn pretty_known(sample: &Sample) -> Option<String> {
         "Code" => "VS Code",
         "spotify" => "Spotify",
         "thunderbird" => "Thunderbird",
+        // Element (Matrix client) on Linux — comm is truncated to 15 chars.
+        "element-desktop" => "Element (Matrix)",
+        "Element" => "Element (Matrix)",
         _ => "",
     };
     if !by_comm.is_empty() {
@@ -377,6 +380,20 @@ fn pretty_cmdline(pid: u32, sample: &Sample, snap: &HashMap<u32, Sample>) -> Str
     }
     if is_guake(sample) {
         return "Guake terminal".to_string();
+    }
+    // Claude Code spawns a fresh `bash -c source <snapshot>.sh && <cmd>` for
+    // every tool call. They surface in the leaderboard as identical-looking
+    // bash lines; collapse to a single readable label with the cwd.
+    if sample.comm == "bash"
+        && sample
+            .cmdline_args
+            .iter()
+            .any(|a| a.contains("/.claude/shell-snapshots/"))
+    {
+        return match cwd_basename(sample) {
+            Some(folder) if folder != "/" => format!("Claude shell ({folder})"),
+            _ => "Claude shell".to_string(),
+        };
     }
     // mysqld / mariadbd: the user runs several instances; the cwd usually
     // points at the data dir, which is the cleanest discriminator.
@@ -2074,6 +2091,51 @@ mod tests {
         assert_eq!(
             pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
             "Slack desktop"
+        );
+    }
+
+    #[test]
+    fn element_desktop_label() {
+        let s = mk("element-desktop", &["/usr/bin/element-desktop"]);
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Element (Matrix)"
+        );
+    }
+
+    #[test]
+    fn claude_shell_with_cwd() {
+        let s = mk_cwd(
+            "bash",
+            &[
+                "bash",
+                "-c",
+                "source /home/u/.claude/shell-snapshots/snapshot-bash-1234.sh && cargo build",
+            ],
+            "/mnt/Dev/@wdes/wattaouille",
+        );
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Claude shell (wattaouille)"
+        );
+    }
+
+    #[test]
+    fn claude_shell_without_cwd() {
+        let s = mk(
+            "bash",
+            &[
+                "bash",
+                "-c",
+                "source /home/u/.claude/shell-snapshots/snapshot-bash-x.sh && ls",
+            ],
+        );
+        let snap_ = snap(vec![(1, s)]);
+        assert_eq!(
+            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
+            "Claude shell"
         );
     }
 

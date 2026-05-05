@@ -222,6 +222,10 @@ cases. Run them in CI; they don't touch real sysfs.
 - **Per-process watts are estimates.** No silicon reports per-PID power. We attribute by CPU share; if your process pegs a core, it gets the watt credit. iGPU work shows up under the iGPU domain (see `/sys/class/powercap/intel-rapl:0:1/uncore`) which we don't currently break out.
 - **AMD/ARM:** the kernel exposes RAPL only on Intel. AMD's `amd_energy` driver lives elsewhere; not yet supported.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the per-release history.
+
 ## License
 
 [MPL-2.0](LICENSE) — Mozilla Public License v2.0. File-level copyleft:
