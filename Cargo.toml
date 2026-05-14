@@ -6,6 +6,10 @@ description = "Live CPU and energy monitor for Linux laptops — finds what's sp
 license = "MPL-2.0"
 repository = "https://github.com/wdes/wattaouille"
 
+[lib]
+name = "wattaouille"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wattaouille"
 path = "src/main.rs"
