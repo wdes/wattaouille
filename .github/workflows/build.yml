@@ -23,13 +23,13 @@ jobs:
               run: cargo fmt -- --check
             - name: Clippy
               run: cargo clippy --all-targets --locked -- -D warnings
-            - name: Build release binary
-              run: cargo build --release --locked
-            - name: Upload release binary
+            - name: Build .deb package
+              run: cargo install cargo-deb && cargo deb --locked
+            - name: Upload .deb package
               uses: actions/upload-artifact@v4
               with:
-                  name: wattaouille-linux-amd64
-                  path: target/release/wattaouille
+                  name: wattaouille-deb
+                  path: target/debian/*.deb
                   retention-days: 5
 
     integration:
@@ -39,13 +39,12 @@ jobs:
         steps:
             - uses: actions/download-artifact@v4
               with:
-                  name: wattaouille-linux-amd64
-            - name: Run --check inside debian:trixie-slim
+                  name: wattaouille-deb
+            - name: Install .deb and run --check
               run: |
-                  chmod +x wattaouille
                   docker run --rm \
-                      -v "$PWD/wattaouille:/usr/local/bin/wattaouille:ro" \
+                      -v "$PWD:/debs:ro" \
                       -v /proc:/proc:ro \
                       -v /sys:/sys:ro \
                       debian:trixie-slim \
-                      wattaouille --check
+                      sh -c "apt-get update && apt-get install -y /debs/*.deb && wattaouille --check"

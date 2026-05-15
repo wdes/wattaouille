@@ -33,6 +33,12 @@ too_many_lines = "allow"
 # Common short names in sensor code (e.g. en/ef, rx/tx, bp/br)
 similar_names = "allow"
 
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+maintainer = "William Desportes <williamdes@wdes.fr>"
+extended-description = "Live CPU and energy monitor for Linux laptops. Shows per-process CPU usage and estimates per-process wattage using Intel RAPL. Features session leaderboard, process tree view, battery cross-check, and browser/IDE process grouping."
+
 [dependencies]
 # Clean Ctrl+C / SIGTERM handler so we can restore the terminal state
 # (alt screen exit + cursor show) on interrupt instead of leaving the user
