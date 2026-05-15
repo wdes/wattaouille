@@ -1,0 +1,51 @@
+name: Build
+
+on: [push, pull_request]
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        name: Build & test & lint
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy, rustfmt
+            - name: Cache cargo artifacts
+              uses: Swatinem/rust-cache@v2
+            - name: Run tests
+              run: cargo test --locked --all-targets
+            - name: Check formatting
+              run: cargo fmt -- --check
+            - name: Clippy
+              run: cargo clippy --all-targets --locked -- -D warnings
+            - name: Build release binary
+              run: cargo build --release --locked
+            - name: Upload release binary
+              uses: actions/upload-artifact@v4
+              with:
+                  name: wattaouille-linux-amd64
+                  path: target/release/wattaouille
+                  retention-days: 5
+
+    integration:
+        name: Integration test (debian:trixie-slim)
+        runs-on: ubuntu-latest
+        needs: build
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  name: wattaouille-linux-amd64
+            - name: Run --check inside debian:trixie-slim
+              run: |
+                  chmod +x wattaouille
+                  docker run --rm \
+                      -v "$PWD/wattaouille:/usr/local/bin/wattaouille:ro" \
+                      -v /proc:/proc:ro \
+                      -v /sys:/sys:ro \
+                      debian:trixie-slim \
+                      wattaouille --check
