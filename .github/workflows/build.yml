@@ -31,12 +31,14 @@ jobs:
                   name: wattaouille-deb
                   path: target/debian/*.deb
                   retention-days: 5
+                  archive: false
             - name: Upload release binary
               uses: actions/upload-artifact@v6
               with:
                   name: wattaouille-linux-amd64
                   path: target/release/wattaouille
                   retention-days: 5
+                  archive: false
 
     integration:
         name: Integration test (debian:trixie-slim)
