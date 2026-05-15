@@ -2,9 +2,16 @@
 name = "wattaouille"
 version = "1.3.5"
 edition = "2024"
+rust-version = "1.92"
+authors = ["William Desportes <williamdes@wdes.fr>"]
 description = "Live CPU and energy monitor for Linux laptops — finds what's spinning your fan and how many watts it's burning"
 license = "MPL-2.0"
+homepage = "https://github.com/wdes/wattaouille#readme"
 repository = "https://github.com/wdes/wattaouille"
+readme = "README.md"
+keywords = ["cpu", "energy", "power", "rapl", "monitor"]
+categories = ["command-line-utilities", "hardware-support"]
+include = ["/src/**/*.rs", "/Cargo.toml", "/LICENSE", "/README.md", "/CHANGELOG.md"]
 
 [lib]
 name = "wattaouille"

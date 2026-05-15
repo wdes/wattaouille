@@ -1,0 +1,7 @@
+* text=auto
+*.lock linguist-generated
+
+.github/ export-ignore
+.claude/ export-ignore
+AGENTS.md export-ignore
+CLAUDE.md export-ignore
