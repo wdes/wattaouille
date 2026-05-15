@@ -226,6 +226,18 @@ cases. Run them in CI; they don't touch real sysfs.
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release history.
 
+## Unsafe code
+
+`unsafe_code` is denied crate-wide via `Cargo.toml` lints. Three functions in `src/main.rs` carry `#[allow(unsafe_code)]` because they must call libc directly:
+
+| Function | Why |
+|---|---|
+| `enter_raw_mode()` | Calls `libc::tcgetattr` / `libc::tcsetattr` to disable echo and canonical mode on stdin while the alt screen is active. Without this, scroll events echo arrow-key escape sequences as visible garbage. |
+| `restore_terminal_mode()` | Calls `libc::tcsetattr` to restore the original termios state. Called from the signal handler thread, so it must be async-signal-safe (no Rust mutexes). |
+| `install_signal_handlers()` | Declares `extern "C" { fn write(...) }` and calls it to write the alt-screen-exit escape sequence directly to fd 1 from the ctrlc handler thread, bypassing Rust's stdout lock which may be held by the render loop. |
+
+All three are confined to terminal state management and do not touch user data.
+
 ## License
 
 [MPL-2.0](LICENSE) — Mozilla Public License v2.0. File-level copyleft:
