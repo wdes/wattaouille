@@ -31,6 +31,12 @@ jobs:
                   name: wattaouille-deb
                   path: target/debian/*.deb
                   retention-days: 5
+            - name: Upload release binary
+              uses: actions/upload-artifact@v4
+              with:
+                  name: wattaouille-linux-amd64
+                  path: target/release/wattaouille
+                  retention-days: 5
 
     integration:
         name: Integration test (debian:trixie-slim)
@@ -39,11 +45,25 @@ jobs:
         steps:
             - uses: actions/download-artifact@v4
               with:
+                  name: wattaouille-linux-amd64
+                  path: bin
+            - uses: actions/download-artifact@v4
+              with:
                   name: wattaouille-deb
+                  path: deb
+            - name: Run --check before installing .deb
+              continue-on-error: true
+              run: |
+                  docker run --rm \
+                      -v "$PWD/bin/wattaouille:/usr/local/bin/wattaouille:ro" \
+                      -v /proc:/proc:ro \
+                      -v /sys:/sys:ro \
+                      debian:trixie-slim \
+                      wattaouille --check
             - name: Install .deb and run --check
               run: |
                   docker run --rm \
-                      -v "$PWD:/debs:ro" \
+                      -v "$PWD/deb:/debs:ro" \
                       -v /proc:/proc:ro \
                       -v /sys:/sys:ro \
                       debian:trixie-slim \
