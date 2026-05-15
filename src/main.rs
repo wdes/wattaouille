@@ -570,10 +570,8 @@ impl BacklightSensor {
                 continue;
             }
             let base = entry.path();
-            let enabled = fs::read_to_string(base.join("enabled"))
-                .is_ok_and(|s| s.trim() == "enabled");
-            let connected = fs::read_to_string(base.join("status"))
-                .is_ok_and(|s| s.trim() == "connected");
+            let enabled = fs::read_to_string(base.join("enabled")).is_ok_and(|s| s.trim() == "enabled");
+            let connected = fs::read_to_string(base.join("status")).is_ok_and(|s| s.trim() == "connected");
             if !(enabled && connected) {
                 continue;
             }
