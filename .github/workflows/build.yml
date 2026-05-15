@@ -51,6 +51,8 @@ jobs:
               with:
                   name: wattaouille-deb
                   path: deb
+            - name: Mark binary as executable
+              run: chmod +x bin/wattaouille
             - name: Run --check before installing .deb
               continue-on-error: true
               run: |
