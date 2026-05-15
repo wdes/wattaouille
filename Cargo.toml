@@ -14,6 +14,25 @@ path = "src/lib.rs"
 name = "wattaouille"
 path = "src/main.rs"
 
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# Sensor math requires constant casting between u64/i64/f64/usize
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+# Long match arms in pretty_known process labelling
+too_many_lines = "allow"
+# Common short names in sensor code (e.g. en/ef, rx/tx, bp/br)
+similar_names = "allow"
+
 [dependencies]
 # Clean Ctrl+C / SIGTERM handler so we can restore the terminal state
 # (alt screen exit + cursor show) on interrupt instead of leaving the user
