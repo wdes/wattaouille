@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::sync::OnceLock;
@@ -19,20 +20,22 @@ static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 /// inside the alt screen sends arrow-key escape sequences (`\x1B[A`,
 /// `\x1B[B`) which the kernel's tty driver echoes straight back into the
 /// alt-screen view as visible garbage.
+#[allow(unsafe_code)]
 fn enter_raw_mode() {
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+        if libc::tcgetattr(libc::STDIN_FILENO, &raw mut t) != 0 {
             return; // not a tty (piped) — nothing to do
         }
         let _ = ORIGINAL_TERMIOS.set(t);
         t.c_lflag &= !(libc::ICANON | libc::ECHO);
-        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const t);
     }
 }
 
 /// Put stdin back into whatever mode it was in at startup. Safe to call from
 /// the ctrlc handler thread because `OnceLock::get` is lock-free.
+#[allow(unsafe_code)]
 fn restore_terminal_mode() {
     if let Some(t) = ORIGINAL_TERMIOS.get() {
         unsafe {
@@ -44,11 +47,12 @@ fn restore_terminal_mode() {
 /// Install a Ctrl+C / SIGTERM handler that restores the terminal state
 /// (exits the alt screen and reshows the cursor) before exiting. Without
 /// this, SIGINT either tears down the process with the alt screen still
-/// active (cursor hidden) or — once we hold a stdout lock in the render
-/// loop — deadlocks if the handler also tries to lock stdout. We bypass
-/// the Rust mutex by writing the restore sequence directly via libc::write
+/// active (cursor hidden) or -- once we hold a stdout lock in the render
+/// loop -- deadlocks if the handler also tries to lock stdout. We bypass
+/// the Rust mutex by writing the restore sequence directly via `libc::write`
 /// to fd 1; that's a single syscall and is safe to call from the ctrlc
 /// crate's handler thread even while main holds the std lock.
+#[allow(unsafe_code)]
 fn install_signal_handlers() {
     unsafe extern "C" {
         fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -64,7 +68,6 @@ fn install_signal_handlers() {
         std::process::exit(130);
     });
 }
-
 
 fn cwd_basename(sample: &Sample) -> Option<&str> {
     sample
@@ -192,17 +195,13 @@ fn pretty_known(sample: &Sample) -> Option<String> {
         "blueman-applet" => "Blueman (applet)",
         // Smartgit launcher script
         "smartgit.sh" => "SmartGit (launcher)",
-        "slack" => "Slack desktop",
-        "Slack" => "Slack desktop",
-        "discord" => "Discord",
-        "Discord" => "Discord",
-        "code" => "VS Code",
-        "Code" => "VS Code",
+        "slack" | "Slack" => "Slack desktop",
+        "discord" | "Discord" => "Discord",
+        "code" | "Code" => "VS Code",
         "spotify" => "Spotify",
         "thunderbird" => "Thunderbird",
         // Element (Matrix client) on Linux — comm is truncated to 15 chars.
-        "element-desktop" => "Element (Matrix)",
-        "Element" => "Element (Matrix)",
+        "element-desktop" | "Element" => "Element (Matrix)",
         _ => "",
     };
     if !by_comm.is_empty() {
@@ -216,16 +215,14 @@ fn pretty_known(sample: &Sample) -> Option<String> {
         let mut iter = sample.cmdline_args.iter();
         let mut id: Option<&str> = None;
         while let Some(a) = iter.next() {
-            if a == "-id" || a == "--id" {
-                if let Some(next) = iter.next() {
-                    id = Some(next.as_str());
-                    break;
-                }
+            if (a == "-id" || a == "--id")
+                && let Some(next) = iter.next()
+            {
+                id = Some(next.as_str());
+                break;
             }
         }
-        let short: String = id
-            .map(|s| s.chars().take(8).collect())
-            .unwrap_or_default();
+        let short: String = id.map(|s| s.chars().take(8).collect()).unwrap_or_default();
         return Some(if short.is_empty() {
             "containerd-shim".to_string()
         } else {
@@ -237,51 +234,43 @@ fn pretty_known(sample: &Sample) -> Option<String> {
     // plugin's library basename is the human name we want.
     if sample.comm == "wrapper-2.0" {
         let plugin = sample.cmdline_args.iter().find_map(|a| {
-            if a.contains("/xfce4/panel/plugins/lib") && a.ends_with(".so") {
+            if a.contains("/xfce4/panel/plugins/lib")
+                && std::path::Path::new(a)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+            {
                 let base = a.rsplit('/').next()?;
-                Some(
-                    base.trim_start_matches("lib")
-                        .trim_end_matches(".so")
-                        .to_string(),
-                )
+                Some(base.trim_start_matches("lib").trim_end_matches(".so").to_string())
             } else {
                 None
             }
         });
-        return Some(match plugin {
-            Some(p) => format!("Xfce panel plugin ({p})"),
-            None => "Xfce panel plugin".to_string(),
-        });
+        return Some(plugin.map_or_else(
+            || "Xfce panel plugin".to_string(),
+            |p| format!("Xfce panel plugin ({p})"),
+        ));
     }
 
     // Blueman tray apps: launched as `python3 /usr/bin/blueman-tray`.
-    if matches!(sample.comm.as_str(), "python3" | "python") {
-        if let Some(blue) = sample
-            .cmdline_args
-            .iter()
-            .find(|a| a.contains("/blueman-"))
-        {
-            let base = blue.rsplit('/').next().unwrap_or(blue);
-            let kind = base.trim_start_matches("blueman-");
-            return Some(format!("Blueman ({kind})"));
-        }
+    if matches!(sample.comm.as_str(), "python3" | "python")
+        && let Some(blue) = sample.cmdline_args.iter().find(|a| a.contains("/blueman-"))
+    {
+        let base = blue.rsplit('/').next().unwrap_or(blue);
+        let kind = base.trim_start_matches("blueman-");
+        return Some(format!("Blueman ({kind})"));
     }
 
-    // Angular CLI dev server: `node …/ng serve --port=4200 …`
-    if sample.comm == "node" || sample.comm == "ng" {
-        if sample.cmdline_args.iter().any(|a| a == "ng" || a.ends_with("/ng"))
-            && sample.cmdline_args.iter().any(|a| a == "serve")
-        {
-            let port = sample.cmdline_args.iter().find_map(|a| {
-                a.strip_prefix("--port=")
-                    .map(String::from)
-                    .or_else(|| a.strip_prefix("-p=").map(String::from))
-            });
-            return Some(match port {
-                Some(p) => format!("ng serve (:{p})"),
-                None => "ng serve".to_string(),
-            });
-        }
+    // Angular CLI dev server: `node .../ng serve --port=4200 ...`
+    if (sample.comm == "node" || sample.comm == "ng")
+        && sample.cmdline_args.iter().any(|a| a == "ng" || a.ends_with("/ng"))
+        && sample.cmdline_args.iter().any(|a| a == "serve")
+    {
+        let port = sample.cmdline_args.iter().find_map(|a| {
+            a.strip_prefix("--port=")
+                .map(String::from)
+                .or_else(|| a.strip_prefix("-p=").map(String::from))
+        });
+        return Some(port.map_or_else(|| "ng serve".to_string(), |p| format!("ng serve (:{p})")));
     }
 
     None
@@ -311,7 +300,7 @@ fn happy_subcommand(sample: &Sample) -> Option<&str> {
 
 /// True if any ancestor (via real ppid in /proc) was launched through Happy.
 fn ancestor_via_happy(pid: u32, snap: &HashMap<u32, Sample>) -> bool {
-    let mut next = snap.get(&pid).map(|s| s.ppid).unwrap_or(0);
+    let mut next = snap.get(&pid).map_or(0, |s| s.ppid);
     while next != 0 {
         let Some(parent) = snap.get(&next) else { break };
         for arg in &parent.cmdline_args {
@@ -397,8 +386,9 @@ fn pretty_cmdline(pid: u32, sample: &Sample, snap: &HashMap<u32, Sample>) -> Str
 /// Reads `/sys/class/power_supply/BAT*/power_now` (instantaneous draw in µW)
 /// and the AC adapter online flag, so we can compare it to the RAPL package
 /// total. RAPL only accounts for the CPU package; the battery sees the full
-/// system (display, RAM, NVMe, Wi-Fi, etc.), so BAT will normally exceed RAPL
+/// system (display, RAM, `NVMe`, Wi-Fi, etc.), so BAT will normally exceed RAPL
 /// when discharging, and the gap is "rest-of-system" draw.
+#[allow(clippy::struct_field_names)]
 struct BatterySensor {
     power_now_path: Option<String>,
     status_path: Option<String>,
@@ -454,15 +444,15 @@ impl BatterySensor {
     }
 
     fn discharging(&self) -> bool {
-        if let Some(p) = &self.ac_online_path {
-            if let Ok(s) = fs::read_to_string(p) {
-                return s.trim() == "0";
-            }
+        if let Some(p) = &self.ac_online_path
+            && let Ok(s) = fs::read_to_string(p)
+        {
+            return s.trim() == "0";
         }
-        if let Some(p) = &self.status_path {
-            if let Ok(s) = fs::read_to_string(p) {
-                return s.trim().eq_ignore_ascii_case("Discharging");
-            }
+        if let Some(p) = &self.status_path
+            && let Ok(s) = fs::read_to_string(p)
+        {
+            return s.trim().eq_ignore_ascii_case("Discharging");
         }
         false
     }
@@ -491,7 +481,7 @@ impl BatterySensor {
         Some(energy_uwh as f64 / power_uw as f64)
     }
 
-    /// State of charge as a percentage (energy_now / energy_full), 0–100.
+    /// State of charge as a percentage (`energy_now` / `energy_full`), 0--100.
     fn percent(&self) -> Option<f64> {
         let en: u64 = fs::read_to_string(self.energy_now_path.as_ref()?)
             .ok()?
@@ -599,22 +589,23 @@ impl BacklightSensor {
 
     /// True when the panel is in any kind of off / blanked state. We check
     /// two sources because they don't always agree:
-    ///   1. `bl_power` (legacy fbdev): non-zero ⇒ off.
-    ///   2. DRM connector `dpms`: anything other than "On" ⇒ off.
+    ///
+    ///   1. `bl_power` (legacy fbdev): non-zero => off.
+    ///   2. DRM connector `dpms`: anything other than "On" => off.
+    ///
     /// Either saying off is treated as off. Missing files mean "no opinion".
     fn is_powered_off(&self) -> bool {
-        if let Some(p) = &self.bl_power_path {
-            if let Ok(s) = fs::read_to_string(p) {
-                if s.trim().parse::<u32>().map(|v| v != 0).unwrap_or(false) {
-                    return true;
-                }
-            }
+        if let Some(p) = &self.bl_power_path
+            && let Ok(s) = fs::read_to_string(p)
+            && s.trim().parse::<u32>().is_ok_and(|v| v != 0)
+        {
+            return true;
         }
         for p in &self.dpms_paths {
-            if let Ok(s) = fs::read_to_string(p) {
-                if !s.trim().eq_ignore_ascii_case("on") {
-                    return true;
-                }
+            if let Ok(s) = fs::read_to_string(p)
+                && !s.trim().eq_ignore_ascii_case("on")
+            {
+                return true;
             }
         }
         false
@@ -637,7 +628,7 @@ impl BacklightSensor {
             return None;
         }
         let f = self.fraction()?.clamp(0.0, 1.0);
-        Some(Self::BASE_W + (Self::MAX_W - Self::BASE_W) * f)
+        Some((Self::MAX_W - Self::BASE_W).mul_add(f, Self::BASE_W))
     }
 }
 
@@ -680,8 +671,8 @@ impl NetSensor {
             let base = format!("/sys/class/net/{name}");
             // A wireless interface exposes either a `wireless/` directory or
             // a `phy80211` symlink.
-            let is_wireless = fs::metadata(format!("{base}/wireless")).is_ok()
-                || fs::metadata(format!("{base}/phy80211")).is_ok();
+            let is_wireless =
+                fs::metadata(format!("{base}/wireless")).is_ok() || fs::metadata(format!("{base}/phy80211")).is_ok();
             ifaces.push(NetIface {
                 name: name.to_string(),
                 rx_path: format!("{base}/statistics/rx_bytes"),
@@ -715,8 +706,7 @@ impl NetSensor {
                 let linked = fs::read_to_string(&i.carrier_path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|v| v == 1)
-                    .unwrap_or(false);
+                    .is_some_and(|v| v == 1);
                 out.wireless_associated = out.wireless_associated || linked;
             }
         }
@@ -735,14 +725,14 @@ impl NetSensor {
 ///   associated, idle traffic → 0.7 W (RX listen + occasional beacons)
 ///   ramps linearly to ~2.5 W at 5 MB/s aggregated rx+tx
 fn estimate_wifi_radio_watts(associated: bool, throughput_bytes_per_sec: f64) -> f64 {
-    if !associated {
-        return 0.0;
-    }
     const IDLE_W: f64 = 0.7;
     const HEAVY_W: f64 = 2.5;
     const HEAVY_THRESHOLD_BPS: f64 = 5.0 * 1024.0 * 1024.0; // 5 MB/s
+    if !associated {
+        return 0.0;
+    }
     let f = (throughput_bytes_per_sec / HEAVY_THRESHOLD_BPS).clamp(0.0, 1.0);
-    IDLE_W + (HEAVY_W - IDLE_W) * f
+    (HEAVY_W - IDLE_W).mul_add(f, IDLE_W)
 }
 
 /// Format a byte rate in human-friendly units.
@@ -751,13 +741,16 @@ fn fmt_byte_rate(bps: f64) -> String {
         return "0 B/s".to_string();
     }
     if bps < 1024.0 {
-        format!("{:.0} B/s", bps)
+        format!("{bps:.0} B/s")
     } else if bps < 1024.0 * 1024.0 {
-        format!("{:.1} KB/s", bps / 1024.0)
+        let kb = bps / 1024.0;
+        format!("{kb:.1} KB/s")
     } else if bps < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} MB/s", bps / 1024.0 / 1024.0)
+        let mb = bps / 1024.0 / 1024.0;
+        format!("{mb:.1} MB/s")
     } else {
-        format!("{:.2} GB/s", bps / 1024.0 / 1024.0 / 1024.0)
+        let gb = bps / 1024.0 / 1024.0 / 1024.0;
+        format!("{gb:.2} GB/s")
     }
 }
 
@@ -770,19 +763,11 @@ fn fmt_hours(h: f64) -> String {
     format!("{}h {:02}m", total_min / 60, total_min % 60)
 }
 
-
 fn term_cols() -> usize {
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(160)
+    env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(160)
 }
 
-fn subtree_delta(
-    pid: u32,
-    deltas: &HashMap<u32, u64>,
-    children: &HashMap<u32, Vec<u32>>,
-) -> u64 {
+fn subtree_delta(pid: u32, deltas: &HashMap<u32, u64>, children: &HashMap<u32, Vec<u32>>) -> u64 {
     let mut total = *deltas.get(&pid).unwrap_or(&0);
     if let Some(kids) = children.get(&pid) {
         for c in kids {
@@ -839,7 +824,7 @@ fn flatten_visible(
         let Some(sample) = snap.get(&pid) else { continue };
         let own = deltas.get(&pid).copied().unwrap_or(0);
         if own == 0 && !is_collapse_root(sample) {
-            let kids = children.get(&pid).map(|v| v.as_slice()).unwrap_or(&[]);
+            let kids = children.get(&pid).map_or(&[][..], |v| v.as_slice());
             out.extend(flatten_visible(kids, snap, deltas, children, subtree));
         } else {
             out.push(pid);
@@ -848,11 +833,7 @@ fn flatten_visible(
     out
 }
 
-fn count_descendants(
-    pid: u32,
-    children: &HashMap<u32, Vec<u32>>,
-    deltas: &HashMap<u32, u64>,
-) -> (usize, u64) {
+fn count_descendants(pid: u32, children: &HashMap<u32, Vec<u32>>, deltas: &HashMap<u32, u64>) -> (usize, u64) {
     let mut count = 0usize;
     let mut total = 0u64;
     if let Some(kids) = children.get(&pid) {
@@ -912,12 +893,11 @@ fn print_node(
     let mut label = pretty_cmdline(pid, sample, snap);
     if collapse {
         let (descendants, _) = count_descendants(pid, children, deltas);
-        label = format!("[{}, {} procs] {}", sample.comm, descendants + 1, label);
+        let comm = &sample.comm;
+        let nprocs = descendants + 1;
+        label = format!("[{comm}, {nprocs} procs] {label}");
     }
-    let line_prefix = format!(
-        "{:>7}  {:>6.1}%  {:>6.1}%  {}{}",
-        pid, pct_total, pct_core, prefix, branch
-    );
+    let line_prefix = format!("{pid:>7}  {pct_total:>6.1}%  {pct_core:>6.1}%  {prefix}{branch}");
     let budget = cols.saturating_sub(line_prefix.chars().count()).max(10);
     let label_trunc: String = label.chars().take(budget).collect();
     writeln!(out, "{line_prefix}{label_trunc}")?;
@@ -937,7 +917,7 @@ fn print_node(
 
     // Visible children: flatten any 0%-own-CPU descendants up so idle middlemen
     // don't show, and sort by subtree delta so the busiest path is at the top.
-    let raw_kids = children.get(&pid).map(|v| v.as_slice()).unwrap_or(&[]);
+    let raw_kids = children.get(&pid).map_or(&[][..], |v| v.as_slice());
     let mut visible = flatten_visible(raw_kids, snap, deltas, children, subtree);
     visible.sort_by(|a, b| {
         subtree
@@ -989,6 +969,7 @@ Options:
   -i, --interval <MS>   Sampling interval in milliseconds [default: 1500]
   -n, --rows <N>        Total rows budget per frame       [default: 50]
       --no-power        Force wattage off (test the new-user fallback path)
+      --check           Verify runtime deps (/proc, /sys) and exit
   -V, --version         Print version and exit
   -h, --help            Show this help and exit
 
@@ -1025,6 +1006,42 @@ Press Ctrl+C to quit."
     );
 }
 
+fn run_check() -> io::Result<()> {
+    println!("wattaouille v{} --check", env!("CARGO_PKG_VERSION"));
+
+    print!("  /proc/stat ........... ");
+    if fs::metadata("/proc/stat").is_ok() {
+        let jiffies = total_cpu_jiffies();
+        println!("ok (total jiffies: {jiffies})");
+    } else {
+        println!("MISSING");
+        return Err(io::Error::new(io::ErrorKind::NotFound, "/proc/stat not found"));
+    }
+
+    print!("  /proc (snapshot) ..... ");
+    let snap = snapshot();
+    if snap.is_empty() {
+        println!("FAIL (no processes)");
+        return Err(io::Error::other("snapshot returned no processes"));
+    }
+    println!("ok ({} processes)", snap.len());
+
+    print!("  CPUs ................. ");
+    let cpus = num_cpus();
+    println!("{cpus}");
+
+    print!("  RAPL ................. ");
+    let power = PowerSensor::detect(false);
+    if power.enabled {
+        println!("ok ({})", power.energy_path);
+    } else {
+        println!("not available (non-fatal)");
+    }
+
+    println!("all checks passed");
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     install_signal_handlers();
     let args: Vec<String> = env::args().collect();
@@ -1035,10 +1052,12 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         let prog = args
             .first()
-            .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-            .unwrap_or("wattaouille");
+            .map_or("wattaouille", |s| s.rsplit('/').next().unwrap_or(s.as_str()));
         print_help(prog);
         return Ok(());
+    }
+    if args.iter().any(|a| a == "--check") {
+        return run_check();
     }
     let interval_ms: u64 = args
         .iter()
@@ -1065,7 +1084,7 @@ fn main() -> io::Result<()> {
     let mut prev_energy_uj = power.read_uj();
     // Per-subdomain previous readings (core, uncore, dram).
     let mut prev_subdomain_uj: Vec<Option<u64>> =
-        power.subdomains.iter().map(|d| d.read_uj()).collect();
+        power.subdomains.iter().map(wattaouille::RaplDomain::read_uj).collect();
     // Per-subdomain cumulative joules for the session.
     let mut subdomain_joules: Vec<f64> = vec![0.0; power.subdomains.len()];
     let mut cumulative_joules: HashMap<u32, f64> = HashMap::new();
@@ -1080,8 +1099,7 @@ fn main() -> io::Result<()> {
     let mut cumulative_io: HashMap<u32, u64> = HashMap::new();
     let initial_net = net.read();
     let mut net_prev_total: u64 = initial_net.rx_bytes_total + initial_net.tx_bytes_total;
-    let mut net_prev_wireless: u64 =
-        initial_net.rx_bytes_wireless + initial_net.tx_bytes_wireless;
+    let mut net_prev_wireless: u64 = initial_net.rx_bytes_wireless + initial_net.tx_bytes_wireless;
     let mut display_joules: f64 = 0.0;
     let mut wifi_joules: f64 = 0.0;
     for (pid, sample) in &prev_snap {
@@ -1123,7 +1141,7 @@ fn main() -> io::Result<()> {
         let cur_snap = snapshot();
         let cur_energy_uj = power.read_uj();
         let cur_subdomain_uj: Vec<Option<u64>> =
-            power.subdomains.iter().map(|d| d.read_uj()).collect();
+            power.subdomains.iter().map(wattaouille::RaplDomain::read_uj).collect();
         let total_delta = cur_total.saturating_sub(prev_total).max(1);
 
         // Joules spent across the whole CPU package during the sample.
@@ -1149,10 +1167,8 @@ fn main() -> io::Result<()> {
         let net_now = net.read();
         let net_total_now = net_now.rx_bytes_total + net_now.tx_bytes_total;
         let net_wireless_now = net_now.rx_bytes_wireless + net_now.tx_bytes_wireless;
-        let net_total_bps =
-            net_total_now.saturating_sub(net_prev_total) as f64 / interval_secs;
-        let net_wireless_bps =
-            net_wireless_now.saturating_sub(net_prev_wireless) as f64 / interval_secs;
+        let net_total_bps = net_total_now.saturating_sub(net_prev_total) as f64 / interval_secs;
+        let net_wireless_bps = net_wireless_now.saturating_sub(net_prev_wireless) as f64 / interval_secs;
         net_prev_total = net_total_now;
         net_prev_wireless = net_wireless_now;
 
@@ -1188,10 +1204,9 @@ fn main() -> io::Result<()> {
 
         let mut deltas: HashMap<u32, u64> = HashMap::with_capacity(cur_snap.len());
         for (pid, after) in &cur_snap {
-            let d = match prev_snap.get(pid) {
-                Some(before) => after.cpu_jiffies.saturating_sub(before.cpu_jiffies),
-                None => 0,
-            };
+            let d = prev_snap
+                .get(pid)
+                .map_or(0, |before| after.cpu_jiffies.saturating_sub(before.cpu_jiffies));
             deltas.insert(*pid, d);
         }
 
@@ -1332,16 +1347,17 @@ fn main() -> io::Result<()> {
             let mut sub: Vec<String> = Vec::new();
             for (i, dom) in power.subdomains.iter().enumerate() {
                 let w = frame_subdomain_joules[i] / interval_secs;
-                sub.push(format!("{} {:>5.1} W", dom.label, w));
+                let label = &dom.label;
+                sub.push(format!("{label} {w:>5.1} W"));
             }
             let sub_str = if sub.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", sub.join(" · "))
+                let joined = sub.join(" · ");
+                format!(" ({joined})")
             };
             bits.push(format!(
-                "⚡ RAPL {:>5.1} W avg{} · {:.3} Wh ({:.0} J)",
-                avg_w, sub_str, total_wh, total_joules
+                "⚡ RAPL {avg_w:>5.1} W avg{sub_str} · {total_wh:.3} Wh ({total_joules:.0} J)"
             ));
         }
         if discharging {
@@ -1352,22 +1368,20 @@ fn main() -> io::Result<()> {
                     0.0
                 };
                 let bat_wh = bat_joules / 3600.0;
-                let mut s = format!(
-                    "🔋 BAT {:>5.1} W avg · {:.3} Wh ({:.0} J)",
-                    bat_avg_w, bat_wh, bat_joules
-                );
+                let mut s = format!("🔋 BAT {bat_avg_w:>5.1} W avg · {bat_wh:.3} Wh ({bat_joules:.0} J)");
                 if let Some(pct) = battery.percent() {
-                    s.push_str(&format!(" · {:.0}%", pct));
+                    let _ = write!(s, " · {pct:.0}%");
                 }
                 if let Some(h) = battery.time_to_empty_hours() {
-                    s.push_str(&format!(" · {} left", fmt_hours(h)));
+                    let left = fmt_hours(h);
+                    let _ = write!(s, " · {left} left");
                 }
                 bits.push(s);
             }
         } else if battery.power_now_path.is_some() {
             let mut s = "🔌 on AC".to_string();
             if let Some(pct) = battery.percent() {
-                s.push_str(&format!(" · {:.0}%", pct));
+                let _ = write!(s, " · {pct:.0}%");
             }
             bits.push(s);
         }
@@ -1384,21 +1398,17 @@ fn main() -> io::Result<()> {
             };
             let non_cpu_wh = non_cpu_j / 3600.0;
             bits.push(format!(
-                "Δ non-CPU {:>+6.1} W avg · {:.3} Wh ({:.0} J · {:+.0}%)",
-                non_cpu_w, non_cpu_wh, non_cpu_j, drift_pct
+                "Δ non-CPU {non_cpu_w:>+6.1} W avg · {non_cpu_wh:.3} Wh ({non_cpu_j:.0} J · {drift_pct:+.0}%)"
             ));
         }
         // Multi-line header. Line 1: runtime stats + Ctrl+C hint. Line 2:
         // CPU package energy. Line 3 (when on battery): battery + drift.
         // Line 4: non-CPU breakdown (display, Wi-Fi radio, network, drift).
+        let version = env!("CARGO_PKG_VERSION");
+        let nprocs = cur_snap.len();
         writeln!(
             out,
-            "wattaouille v{} — {} ms · {} CPU(s) · {} procs · ~{:.0}s tracked · Ctrl+C to quit",
-            env!("CARGO_PKG_VERSION"),
-            interval_ms,
-            cpus,
-            cur_snap.len(),
-            session_secs
+            "wattaouille v{version} — {interval_ms} ms · {cpus} CPU(s) · {nprocs} procs · ~{session_secs:.0}s tracked · Ctrl+C to quit",
         )?;
         if !bits.is_empty() {
             writeln!(out, "{}", bits.join(" · "))?;
@@ -1412,22 +1422,16 @@ fn main() -> io::Result<()> {
             let pct = backlight.fraction().unwrap_or(0.0) * 100.0;
             let total_wh = display_joules / 3600.0;
             // `~` prefix flags this as a model-based estimate, not a sensor read.
-            non_cpu_bits.push(format!(
-                "🖥 ~{:>5.1} W ({:.0}% bl · ~{:.3} Wh)",
-                w, pct, total_wh
-            ));
+            non_cpu_bits.push(format!("🖥 ~{w:>5.1} W ({pct:.0}% bl · ~{total_wh:.3} Wh)"));
         }
         if let Some(w) = wifi_w {
             let total_wh = wifi_joules / 3600.0;
-            non_cpu_bits.push(format!(
-                "📡 Wi-Fi ~{:>5.1} W ({} · ~{:.3} Wh)",
-                w,
-                fmt_byte_rate(net_wireless_bps),
-                total_wh
-            ));
+            let rate = fmt_byte_rate(net_wireless_bps);
+            non_cpu_bits.push(format!("📡 Wi-Fi ~{w:>5.1} W ({rate} · ~{total_wh:.3} Wh)"));
         }
         if net_total_bps > 1.0 {
-            non_cpu_bits.push(format!("📶 net {}", fmt_byte_rate(net_total_bps)));
+            let rate = fmt_byte_rate(net_total_bps);
+            non_cpu_bits.push(format!("📶 net {rate}"));
         }
         if !non_cpu_bits.is_empty() {
             writeln!(out, "{}", non_cpu_bits.join(" · "))?;
@@ -1436,10 +1440,7 @@ fn main() -> io::Result<()> {
             writeln!(
                 out,
                 "⚠ Wattage disabled ({}). Run with --help for setup.",
-                power
-                    .disabled_reason
-                    .as_deref()
-                    .unwrap_or("RAPL not readable")
+                power.disabled_reason.as_deref().unwrap_or("RAPL not readable")
             )?;
         }
 
@@ -1448,25 +1449,26 @@ fn main() -> io::Result<()> {
         if power.enabled {
             writeln!(
                 out,
-                "{:>7}  {:>7}  {:>7}  {:>7}  {:>16}  {:>10}  {}",
-                "PID", "AVG%", "NOW%", "NOW W", "TOTAL W (J)", "I/O", "COMMAND"
+                "{:>7}  {:>7}  {:>7}  {:>7}  {:>16}  {:>10}  COMMAND",
+                "PID", "AVG%", "NOW%", "NOW W", "TOTAL W (J)", "I/O"
             )?;
         } else {
             writeln!(
                 out,
-                "{:>7}  {:>7}  {:>7}  {:>10}  {}",
-                "PID", "AVG%", "NOW%", "I/O", "COMMAND"
+                "{:>7}  {:>7}  {:>7}  {:>10}  COMMAND",
+                "PID", "AVG%", "NOW%", "I/O"
             )?;
         }
         for (pid, cum, now) in board.iter().take(leaderboard_n) {
             let Some(sample) = cur_snap.get(pid) else { continue };
-            let avg_pct_core =
-                (*cum as f64 / cumulative_total.max(1) as f64) * 100.0 * cpus as f64;
+            let avg_pct_core = (*cum as f64 / cumulative_total.max(1) as f64) * 100.0 * cpus as f64;
             let now_pct_core = (*now as f64 / total_delta as f64) * 100.0 * cpus as f64;
             let mut label = pretty_cmdline(*pid, sample, &cur_snap);
             if is_collapse_root(sample) {
                 let (descendants, _) = count_descendants(*pid, &children, &deltas);
-                label = format!("[{}, {} procs] {}", sample.comm, descendants + 1, label);
+                let comm = &sample.comm;
+                let nprocs = descendants + 1;
+                label = format!("[{comm}, {nprocs} procs] {label}");
             }
             // I/O delta this frame, summed across the subtree for collapse roots.
             let io_now_bps = {
@@ -1521,16 +1523,12 @@ fn main() -> io::Result<()> {
                 } else {
                     0.0
                 };
-                let total_cell = format!("{:.2}W ({:.0}J)", total_w, total_j);
+                let total_cell = format!("{total_w:.2}W ({total_j:.0}J)");
                 format!(
-                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>6.2}W  {:>16}  {:>10}  ",
-                    pid, avg_pct_core, now_pct_core, now_w, total_cell, io_cell
+                    "{pid:>7}  {avg_pct_core:>6.1}%  {now_pct_core:>6.1}%  {now_w:>6.2}W  {total_cell:>16}  {io_cell:>10}  "
                 )
             } else {
-                format!(
-                    "{:>7}  {:>6.1}%  {:>6.1}%  {:>10}  ",
-                    pid, avg_pct_core, now_pct_core, io_cell
-                )
+                format!("{pid:>7}  {avg_pct_core:>6.1}%  {now_pct_core:>6.1}%  {io_cell:>10}  ")
             };
             let budget = cols.saturating_sub(line_prefix.chars().count()).max(10);
             let label_trunc: String = label.chars().take(budget).collect();
@@ -1538,12 +1536,8 @@ fn main() -> io::Result<()> {
         }
 
         // ── Section 2: Live tree (this frame) ─────────────────────────────
-        writeln!(out, "\nLIVE TREE  (this {} ms sample)", interval_ms)?;
-        writeln!(
-            out,
-            "{:>7}  {:>7}  {:>7}  {}",
-            "PID", "%CPU", "%CORE", "TREE / COMMAND"
-        )?;
+        writeln!(out, "\nLIVE TREE  (this {interval_ms} ms sample)")?;
+        writeln!(out, "{:>7}  {:>7}  {:>7}  TREE / COMMAND", "PID", "%CPU", "%CORE")?;
 
         let header_lines = 6 + leaderboard_n.min(board.len());
         let tree_budget = max_rows.saturating_sub(header_lines).max(5);
@@ -1586,7 +1580,7 @@ mod tests {
     fn mk(comm: &str, args: &[&str]) -> Sample {
         Sample {
             comm: comm.to_string(),
-            cmdline_args: args.iter().map(|s| s.to_string()).collect(),
+            cmdline_args: args.iter().map(ToString::to_string).collect(),
             ppid: 0,
             cpu_jiffies: 0,
             cwd: None,
@@ -1647,7 +1641,11 @@ mod tests {
         // Build a snapshot where a Claude process has a Happy ancestor.
         let happy_parent = mk(
             "node",
-            &["/usr/bin/node", "/x/.config/yarn/global/node_modules/happy/dist/index.mjs", "claude"],
+            &[
+                "/usr/bin/node",
+                "/x/.config/yarn/global/node_modules/happy/dist/index.mjs",
+                "claude",
+            ],
         );
         let claude = mk_cwd(
             "claude.exe",
@@ -1662,10 +1660,7 @@ mod tests {
 
     #[test]
     fn pretty_label_for_claude_without_happy_falls_back_to_plain() {
-        let claude = mk(
-            "claude.exe",
-            &["/usr/local/bin/claude.exe", "--session-id", "abc"],
-        );
+        let claude = mk("claude.exe", &["/usr/local/bin/claude.exe", "--session-id", "abc"]);
         let s = snap(vec![(1, claude)]);
         let label = pretty_cmdline(1, s.get(&1).unwrap(), &s);
         assert_eq!(label, "Claude Code");
@@ -1676,7 +1671,11 @@ mod tests {
     fn happy_subcommand_finds_claude() {
         let s = mk(
             "node",
-            &["/usr/bin/node", "/x/.config/yarn/global/node_modules/happy/dist/index.mjs", "claude"],
+            &[
+                "/usr/bin/node",
+                "/x/.config/yarn/global/node_modules/happy/dist/index.mjs",
+                "claude",
+            ],
         );
         assert_eq!(happy_subcommand(&s), Some("claude"));
     }
@@ -1735,10 +1734,7 @@ mod tests {
 
     #[test]
     fn dont_collapse_browser_helper_firefox_style() {
-        let s = mk(
-            "librewolf",
-            &["/usr/bin/librewolf", "-contentproc", "-childID", "1"],
-        );
+        let s = mk("librewolf", &["/usr/bin/librewolf", "-contentproc", "-childID", "1"]);
         assert!(!is_collapse_root(&s));
     }
 
@@ -1767,20 +1763,14 @@ mod tests {
     fn guake_label() {
         let s = mk("python3", &["/usr/bin/python3", "/usr/bin/guake"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "Guake terminal"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "Guake terminal");
     }
 
     #[test]
     fn mysqld_label_with_cwd() {
         let s = mk_cwd("mysqld", &["mysqld", "--sql_mode="], "/var/lib/mysql/projA");
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "mysqld (projA)"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "mysqld (projA)");
     }
 
     #[test]
@@ -1861,7 +1851,7 @@ mod tests {
     // ── Wi-Fi radio estimate ─────────────────────────────────────────
     #[test]
     fn wifi_radio_zero_when_not_associated() {
-        assert_eq!(estimate_wifi_radio_watts(false, 1024.0 * 1024.0), 0.0);
+        assert!(estimate_wifi_radio_watts(false, 1024.0 * 1024.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1891,20 +1881,14 @@ mod tests {
     fn slack_label() {
         let s = mk("slack", &["/usr/bin/slack"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "Slack desktop"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "Slack desktop");
     }
 
     #[test]
     fn element_desktop_label() {
         let s = mk("element-desktop", &["/usr/bin/element-desktop"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "Element (Matrix)"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "Element (Matrix)");
     }
 
     #[test]
@@ -1936,10 +1920,7 @@ mod tests {
             ],
         );
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "Claude shell"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "Claude shell");
     }
 
     // ── Battery time formatter ───────────────────────────────────────
@@ -2030,10 +2011,7 @@ mod tests {
     fn ibus_labels() {
         let s = mk("ibus-daemon", &["ibus-daemon", "--daemonize", "--xim"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "IBus daemon"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "IBus daemon");
     }
 
     #[test]
@@ -2050,10 +2028,7 @@ mod tests {
     fn dockerd_label() {
         let s = mk("dockerd", &["dockerd", "--config-file=/etc/docker/daemon.json"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "Docker daemon"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "Docker daemon");
     }
 
     #[test]
@@ -2082,10 +2057,7 @@ mod tests {
     fn containerd_shim_without_id() {
         let s = mk("containerd-shim", &["containerd-shim-runc-v2", "--help"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "containerd-shim"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "containerd-shim");
     }
 
     #[test]
@@ -2111,29 +2083,17 @@ mod tests {
     fn blueman_tray_label() {
         let s = mk("python3", &["/usr/bin/python3", "/usr/bin/blueman-tray"]);
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "Blueman (tray)"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "Blueman (tray)");
     }
 
     #[test]
     fn ng_serve_label_with_port() {
         let s = mk(
             "node",
-            &[
-                "/usr/bin/node",
-                "/usr/bin/ng",
-                "serve",
-                "--port=4200",
-                "--host=0.0.0.0",
-            ],
+            &["/usr/bin/node", "/usr/bin/ng", "serve", "--port=4200", "--host=0.0.0.0"],
         );
         let snap_ = snap(vec![(1, s)]);
-        assert_eq!(
-            pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_),
-            "ng serve (:4200)"
-        );
+        assert_eq!(pretty_cmdline(1, snap_.get(&1).unwrap(), &snap_), "ng serve (:4200)");
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub struct Sample {
 }
 
 /// Parse `/proc/[pid]/io` and return `read_bytes + write_bytes`.
+#[must_use]
 pub fn parse_proc_io(text: &str) -> u64 {
     let mut rb: u64 = 0;
     let mut wb: u64 = 0;
@@ -66,6 +67,7 @@ pub fn read_proc_stat(pid: &str) -> Option<Sample> {
 }
 
 /// Snapshot all processes from `/proc`.
+#[must_use]
 pub fn snapshot() -> HashMap<u32, Sample> {
     let mut out = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -83,6 +85,7 @@ pub fn snapshot() -> HashMap<u32, Sample> {
 }
 
 /// Total system CPU jiffies from `/proc/stat`.
+#[must_use]
 pub fn total_cpu_jiffies() -> u64 {
     let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
     let first = stat.lines().next().unwrap_or("");
@@ -94,6 +97,7 @@ pub fn total_cpu_jiffies() -> u64 {
 }
 
 /// Number of logical CPUs.
+#[must_use]
 pub fn num_cpus() -> u64 {
     let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
     stat.lines()
@@ -110,14 +114,12 @@ pub struct RaplDomain {
 }
 
 impl RaplDomain {
+    #[must_use]
     pub fn read_uj(&self) -> Option<u64> {
-        fs::read_to_string(&self.energy_path)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        fs::read_to_string(&self.energy_path).ok()?.trim().parse().ok()
     }
 
+    #[must_use]
     pub fn joules_between(&self, before: u64, after: u64) -> f64 {
         let delta_uj = if after >= before {
             after - before
@@ -142,6 +144,7 @@ impl PowerSensor {
     pub const WRAP_PATH: &'static str = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
     pub const DOMAIN_DIR: &'static str = "/sys/class/powercap";
 
+    #[must_use]
     pub fn detect(force_off: bool) -> Self {
         let max_uj = fs::read_to_string(Self::WRAP_PATH)
             .ok()
@@ -211,18 +214,17 @@ impl PowerSensor {
         }
     }
 
+    #[must_use]
     pub fn instructions(&self) -> String {
-        let reason = self
-            .disabled_reason
-            .clone()
-            .unwrap_or_else(|| "unknown".into());
+        use std::fmt::Write;
+        let reason = self.disabled_reason.clone().unwrap_or_else(|| "unknown".into());
 
         let rapl_present = fs::metadata("/sys/class/powercap/intel-rapl:0").is_ok();
         let powercap_present = fs::metadata(Self::DOMAIN_DIR).is_ok();
 
         let mut s = String::new();
         s.push_str("⚡ Wattage disabled\n");
-        s.push_str(&format!("   reason: {reason}\n"));
+        let _ = writeln!(s, "   reason: {reason}");
         if !powercap_present {
             s.push_str(
                 "   /sys/class/powercap is missing — your kernel was built without\n   \
@@ -256,17 +258,15 @@ impl PowerSensor {
         s
     }
 
+    #[must_use]
     pub fn read_uj(&self) -> Option<u64> {
         if !self.enabled {
             return None;
         }
-        fs::read_to_string(&self.energy_path)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        fs::read_to_string(&self.energy_path).ok()?.trim().parse().ok()
     }
 
+    #[must_use]
     pub fn joules_between(&self, before: u64, after: u64) -> f64 {
         let delta_uj = if after >= before {
             after - before
@@ -278,28 +278,23 @@ impl PowerSensor {
 }
 
 /// Children of a given PID via `/proc/[pid]/task/[pid]/children`.
+#[must_use]
 pub fn children_of(pid: u32) -> Vec<u32> {
     let path = format!("/proc/{pid}/task/{pid}/children");
     if let Ok(text) = fs::read_to_string(&path) {
-        return text
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        return text.split_whitespace().filter_map(|s| s.parse().ok()).collect();
     }
     Vec::new()
 }
 
 /// Sum CPU jiffies for a process and all its descendants.
+#[must_use]
 pub fn sum_tree_jiffies(root: u32) -> u64 {
-    let j = read_proc_stat(&root.to_string())
-        .map(|s| s.cpu_jiffies)
-        .unwrap_or(0);
+    let j = read_proc_stat(&root.to_string()).map_or(0, |s| s.cpu_jiffies);
     let mut total = j;
     let mut stack = children_of(root);
     while let Some(pid) = stack.pop() {
-        total += read_proc_stat(&pid.to_string())
-            .map(|s| s.cpu_jiffies)
-            .unwrap_or(0);
+        total += read_proc_stat(&pid.to_string()).map_or(0, |s| s.cpu_jiffies);
         stack.extend(children_of(pid));
     }
     total
@@ -339,7 +334,8 @@ mod tests {
 
     #[test]
     fn parse_proc_io_sums_read_and_write() {
-        let text = "rchar: 999\nwchar: 1\nsyscr: 5\nsyscw: 3\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
+        let text =
+            "rchar: 999\nwchar: 1\nsyscr: 5\nsyscw: 3\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
         assert_eq!(parse_proc_io(text), 4096 + 8192);
     }
 
