@@ -54,14 +54,14 @@ jobs:
             - name: Build .deb package
               run: cargo install cargo-deb && cargo deb --locked
             - name: Upload .deb package
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: wattaouille-deb
                   path: target/debian/*.deb
                   retention-days: 5
                   archive: false
             - name: Upload release binary
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: wattaouille-linux-amd64
                   path: target/release/wattaouille
