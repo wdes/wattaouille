@@ -13,6 +13,9 @@ jobs:
     build:
         name: Build & test & lint
         runs-on: ubuntu-latest
+        outputs:
+            deb-artifact-id: ${{ steps.upload-deb.outputs.artifact-id }}
+            binary-artifact-id: ${{ steps.upload-binary.outputs.artifact-id }}
         steps:
             - uses: actions/checkout@v6
             - name: Install Rust toolchain
@@ -54,6 +57,7 @@ jobs:
             - name: Build .deb package
               run: cargo install cargo-deb && cargo deb --locked
             - name: Upload .deb package
+              id: upload-deb
               uses: actions/upload-artifact@v7
               with:
                   name: wattaouille-deb
@@ -61,6 +65,7 @@ jobs:
                   retention-days: 5
                   archive: false
             - name: Upload release binary
+              id: upload-binary
               uses: actions/upload-artifact@v7
               with:
                   name: wattaouille-linux-amd64
@@ -75,12 +80,14 @@ jobs:
         steps:
             - uses: actions/download-artifact@v7
               with:
-                  name: wattaouille-linux-amd64
+                  artifact-ids: ${{ needs.build.outputs.binary-artifact-id }}
                   path: bin
+                  merge-multiple: true
             - uses: actions/download-artifact@v7
               with:
-                  name: wattaouille-deb
+                  artifact-ids: ${{ needs.build.outputs.deb-artifact-id }}
                   path: deb
+                  merge-multiple: true
             - name: Mark binary as executable
               run: chmod +x bin/wattaouille
             - name: Run --check before installing .deb
