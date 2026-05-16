@@ -1,5 +1,8 @@
 # wattaouille
 
+[![Build](https://github.com/wdes/wattaouille/actions/workflows/build.yml/badge.svg)](https://github.com/wdes/wattaouille/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/wdes/wattaouille/branch/main/graph/badge.svg)](https://codecov.io/gh/wdes/wattaouille)
+
 > *watt + ratatouille + ouille! (ouch!)*  — a French pun for the moment
 > you find out what's been eating your laptop's battery.
 
