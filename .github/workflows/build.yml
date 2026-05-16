@@ -78,16 +78,18 @@ jobs:
         runs-on: ubuntu-latest
         needs: build
         steps:
-            - uses: actions/download-artifact@v7
+            - uses: actions/download-artifact@v8
               with:
                   artifact-ids: ${{ needs.build.outputs.binary-artifact-id }}
                   path: bin
                   merge-multiple: true
-            - uses: actions/download-artifact@v7
+                  skip-decompress: true
+            - uses: actions/download-artifact@v8
               with:
                   artifact-ids: ${{ needs.build.outputs.deb-artifact-id }}
                   path: deb
                   merge-multiple: true
+                  skip-decompress: true
             - name: Mark binary as executable
               run: chmod +x bin/wattaouille
             - name: Run --check before installing .deb
